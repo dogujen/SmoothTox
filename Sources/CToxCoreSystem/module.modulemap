@@ -1,0 +1,4 @@
+module CToxCoreSystem [system] {
+    header "shim.h"
+    export *
+}
