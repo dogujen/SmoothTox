@@ -10,6 +10,7 @@ final class ToxProfileStore {
     private let account = "tox_profile_key_v1"
 
     private let fm = FileManager.default
+    private var cachedKey: Data?
 
     func loadProfileData() -> Data? {
         guard let encryptedBlob = readEncryptedBlobFromSQLite(),
@@ -40,6 +41,7 @@ final class ToxProfileStore {
     func resetAll() {
         deleteDatabaseFiles()
         deleteKeyFromKeychain()
+        cachedKey = nil
     }
 
     private func databaseURL() -> URL? {
@@ -124,7 +126,12 @@ final class ToxProfileStore {
     }
 
     private func loadOrCreateKey() -> Data? {
+        if let cachedKey {
+            return cachedKey
+        }
+
         if let existing = readKeyFromKeychain() {
+            cachedKey = existing
             return existing
         }
 
@@ -134,6 +141,7 @@ final class ToxProfileStore {
 
         let keyData = Data(bytes)
         guard saveKeyToKeychain(keyData) else { return nil }
+        cachedKey = keyData
         return keyData
     }
 

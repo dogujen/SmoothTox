@@ -10,10 +10,12 @@ final class ChatViewModel {
     private let historyStore = MessageHistoryStore()
     private let profileStore = UserProfileStore()
     private let peerAvatarStore = PeerAvatarStore()
+    private let l10n = AppLocalizer.shared
     private var eventTask: Task<Void, Never>?
 
     var peers: [Peer] = []
     var selectedPeerID: UUID?
+    var selectedGroupID: UUID?
     var connectionState: ConnectionState = .offline
     var messageStore: [UUID: [ChatMessage]] = [:]
     var draftMessage = ""
@@ -22,14 +24,23 @@ final class ChatViewModel {
     var selfToxID = "-"
     var didCopyToxID = false
     var messageSearchText = ""
+    var peerSearchText = ""
     var pendingFriendRequests: [FriendRequest] = []
+    var pendingGroupInvites: [GroupInviteRequest] = []
     var pendingFileRequests: [FileTransferRequest] = []
+    var voiceCallStates: [UUID: VoiceCallState] = [:]
+    var groupRooms: [GroupRoom] = []
+    var groupMembersByGroupID: [UUID: [GroupMember]] = [:]
     var addFriendIDInput = ""
+    var hostGroupNameInput = ""
+    var joinGroupInviteInput = ""
     var isAddFriendSheetPresented = false
+    var isHostGroupSheetPresented = false
+    var isJoinGroupSheetPresented = false
     var isResetConfirmationPresented = false
     var isBusy = false
     var isProfileSheetPresented = false
-    var selfDisplayName = "SmoothTox User"
+    var selfDisplayName = AppLocalizer.shared.text("profile.defaultName")
     var selfAvatarPath: String?
     var peerAvatarPaths: [UUID: String] = [:]
     var profileDraftName = ""
@@ -40,12 +51,24 @@ final class ChatViewModel {
     }
 
     var selectedPeerName: String {
-        peers.first(where: { $0.id == selectedPeerID })?.displayName ?? "Sohbet"
+        if let selectedGroupID,
+           let group = groupRooms.first(where: { $0.id == selectedGroupID }) {
+            return group.name
+        }
+
+        return peers.first(where: { $0.id == selectedPeerID })?.displayName ?? l10n.text("chat.defaultTitle")
     }
 
     var visibleMessages: [ChatMessage] {
-        guard let selectedPeerID else { return [] }
-        let allMessages = messageStore[selectedPeerID, default: []]
+        let conversationID: UUID?
+        if let selectedGroupID {
+            conversationID = selectedGroupID
+        } else {
+            conversationID = selectedPeerID
+        }
+
+        guard let conversationID else { return [] }
+        let allMessages = messageStore[conversationID, default: []]
         let query = messageSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return allMessages }
 
@@ -53,6 +76,30 @@ final class ChatViewModel {
             message.text.localizedCaseInsensitiveContains(query)
                 || message.attachmentURL?.lastPathComponent.localizedCaseInsensitiveContains(query) == true
         }
+    }
+
+    var visiblePeers: [Peer] {
+        let query = peerSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return peers }
+
+        return peers.filter { peer in
+            peer.displayName.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var visibleGroups: [GroupRoom] {
+        let query = peerSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return groupRooms }
+
+        return groupRooms.filter { room in
+            room.name.localizedCaseInsensitiveContains(query)
+                || room.chatID.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var selectedGroupMembers: [GroupMember] {
+        guard let selectedGroupID else { return [] }
+        return groupMembersByGroupID[selectedGroupID, default: []]
     }
 
     func bootstrap() {
@@ -81,13 +128,33 @@ final class ChatViewModel {
 
     func selectPeer(_ peerID: UUID) {
         selectedPeerID = peerID
+        selectedGroupID = nil
+    }
+
+    func selectGroup(_ groupID: UUID) {
+        selectedGroupID = groupID
+        selectedPeerID = nil
     }
 
     func sendCurrentMessage() {
         let trimmed = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let selectedPeerID else { return }
+        guard !trimmed.isEmpty else { return }
 
         draftMessage = ""
+
+        if let selectedGroupID {
+            let outgoing = ChatMessage(peerID: selectedGroupID, text: trimmed, isOutgoing: true)
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.82, blendDuration: 0.12)) {
+                messageStore[selectedGroupID, default: []].append(outgoing)
+            }
+
+            Task {
+                _ = await toxClient.sendGroupMessage(trimmed, to: selectedGroupID)
+            }
+            return
+        }
+
+        guard let selectedPeerID else { return }
 
         let outgoing = ChatMessage(peerID: selectedPeerID, text: trimmed, isOutgoing: true)
         withAnimation(.spring(response: 0.30, dampingFraction: 0.82, blendDuration: 0.12)) {
@@ -121,10 +188,94 @@ final class ChatViewModel {
         }
     }
 
+    var selectedPeerCallState: VoiceCallState {
+        guard let selectedPeerID else { return .idle }
+        return voiceCallStates[selectedPeerID] ?? .idle
+    }
+
+    func startCallWithSelectedPeer() {
+        guard let selectedPeerID else { return }
+        Task {
+            _ = await toxClient.startVoiceCall(to: selectedPeerID)
+        }
+    }
+
+    func acceptCallFromSelectedPeer() {
+        guard let selectedPeerID else { return }
+        Task {
+            _ = await toxClient.acceptVoiceCall(from: selectedPeerID)
+        }
+    }
+
+    func endCallWithSelectedPeer() {
+        guard let selectedPeerID else { return }
+        Task {
+            await toxClient.endVoiceCall(with: selectedPeerID)
+        }
+    }
+
+    func openHostGroupDialog() {
+        hostGroupNameInput = ""
+        isHostGroupSheetPresented = true
+    }
+
+    func openJoinGroupDialog() {
+        joinGroupInviteInput = ""
+        isJoinGroupSheetPresented = true
+    }
+
+    func submitHostGroup() {
+        let name = hostGroupNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await toxClient.hostGroup(named: name)
+            if ok {
+                isHostGroupSheetPresented = false
+                hostGroupNameInput = ""
+            }
+        }
+    }
+
+    func submitJoinGroup() {
+        let invite = joinGroupInviteInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !invite.isEmpty else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await toxClient.joinGroup(invite: invite)
+            if ok {
+                isJoinGroupSheetPresented = false
+                joinGroupInviteInput = ""
+            }
+        }
+    }
+
+    func leaveGroup(_ group: GroupRoom) {
+        Task {
+            await toxClient.leaveGroup(id: group.id)
+        }
+    }
+
     func acceptFriendRequest(_ request: FriendRequest) {
         pendingFriendRequests.removeAll(where: { $0.publicKeyHex == request.publicKeyHex })
         Task {
             await toxClient.acceptFriendRequest(publicKeyHex: request.publicKeyHex)
+        }
+    }
+
+    func acceptGroupInvite(_ request: GroupInviteRequest) {
+        pendingGroupInvites.removeAll(where: { $0.id == request.id })
+        Task {
+            _ = await toxClient.acceptGroupInvite(id: request.id)
+        }
+    }
+
+    func rejectGroupInvite(_ request: GroupInviteRequest) {
+        pendingGroupInvites.removeAll(where: { $0.id == request.id })
+        Task {
+            await toxClient.rejectGroupInvite(id: request.id)
         }
     }
 
@@ -137,7 +288,7 @@ final class ChatViewModel {
             if ok {
                 let fileMessage = ChatMessage(
                     peerID: selectedPeerID,
-                    text: "Dosya gönderildi: \(url.lastPathComponent)",
+                    text: l10n.format("message.file.sent", url.lastPathComponent),
                     isOutgoing: true,
                     attachmentURL: url
                 )
@@ -176,7 +327,7 @@ final class ChatViewModel {
         isBusy = true
         Task { @MainActor [weak self] in
             guard let self else { return }
-            _ = await toxClient.sendFriendRequest(to: trimmed, message: "SmoothTox request")
+            _ = await toxClient.sendFriendRequest(to: trimmed, message: l10n.text("friend.request.message"))
             isBusy = false
             isAddFriendSheetPresented = false
             addFriendIDInput = ""
@@ -246,6 +397,9 @@ final class ChatViewModel {
         case .selfToxIDUpdated(let toxID):
             selfToxID = toxID
 
+        case .voiceCallStateChanged(let peerID, let state):
+            voiceCallStates[peerID] = state
+
         case .selfDisplayNameUpdated(let displayName):
             selfDisplayName = displayName
 
@@ -256,6 +410,28 @@ final class ChatViewModel {
         case .peerAvatarCleared(let peerID):
             peerAvatarPaths.removeValue(forKey: peerID)
             peerAvatarStore.removeAvatarPath(for: peerID)
+
+        case .groupRoomsUpdated(let rooms):
+            groupRooms = rooms
+            if let selectedGroupID,
+               !rooms.contains(where: { $0.id == selectedGroupID }) {
+                self.selectedGroupID = nil
+            }
+            groupMembersByGroupID = groupMembersByGroupID.filter { key, _ in
+                rooms.contains(where: { $0.id == key })
+            }
+
+        case .groupInvitesUpdated(let invites):
+            pendingGroupInvites = invites
+
+        case .groupMembersUpdated(let groupID, let members):
+            groupMembersByGroupID[groupID] = members
+
+        case .groupMessageReceived(let groupID, let senderName, let text):
+            let incoming = ChatMessage(peerID: groupID, text: "\(senderName): \(text)", isOutgoing: false)
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
+                messageStore[groupID, default: []].append(incoming)
+            }
 
         case .friendRequestReceived(let request):
             if !pendingFriendRequests.contains(where: { $0.publicKeyHex == request.publicKeyHex }) {
@@ -271,6 +447,9 @@ final class ChatViewModel {
 
         case .peerListUpdated(let updatedPeers):
             peers = updatedPeers
+            voiceCallStates = voiceCallStates.filter { entry in
+                updatedPeers.contains(where: { $0.id == entry.key })
+            }
             var nextAvatarPaths: [UUID: String] = [:]
             for peer in updatedPeers {
                 if let path = peerAvatarStore.loadAvatarPath(for: peer.id) {

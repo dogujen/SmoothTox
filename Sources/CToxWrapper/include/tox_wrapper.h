@@ -16,6 +16,14 @@ typedef void (*toxw_file_recv_cb)(void *swift_user_data, uint32_t friend_number,
 typedef void (*toxw_file_recv_chunk_cb)(void *swift_user_data, uint32_t friend_number, uint32_t file_number, uint64_t position, const uint8_t *data, size_t length);
 typedef void (*toxw_file_chunk_request_cb)(void *swift_user_data, uint32_t friend_number, uint32_t file_number, uint64_t position, size_t length);
 typedef void (*toxw_file_recv_control_cb)(void *swift_user_data, uint32_t friend_number, uint32_t file_number, uint32_t control);
+typedef void (*toxw_group_message_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id, const uint8_t *message, size_t message_length);
+typedef void (*toxw_group_invite_cb)(void *swift_user_data, uint32_t friend_number, const uint8_t *invite_data, size_t invite_data_length, const uint8_t *group_name, size_t group_name_length);
+typedef void (*toxw_group_peer_name_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id, const uint8_t *name, size_t name_length);
+typedef void (*toxw_group_peer_join_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id);
+typedef void (*toxw_group_peer_exit_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id);
+typedef void (*toxw_av_call_cb)(void *swift_user_data, uint32_t friend_number, bool audio_enabled, bool video_enabled);
+typedef void (*toxw_av_call_state_cb)(void *swift_user_data, uint32_t friend_number, uint32_t state);
+typedef void (*toxw_av_audio_frame_cb)(void *swift_user_data, uint32_t friend_number, const int16_t *pcm, size_t sample_count, uint8_t channels, uint32_t sampling_rate);
 
 ToxWrapper *toxw_create(int32_t *out_error_code);
 ToxWrapper *toxw_create_from_savedata(const uint8_t *savedata, size_t savedata_length, int32_t *out_error_code);
@@ -41,6 +49,22 @@ void toxw_set_callbacks(
     toxw_file_recv_chunk_cb file_recv_chunk_callback,
     toxw_file_chunk_request_cb file_chunk_request_callback,
     toxw_file_recv_control_cb file_recv_control_callback
+);
+
+void toxw_set_av_callbacks(
+    ToxWrapper *wrapper,
+    toxw_av_call_cb av_call_callback,
+    toxw_av_call_state_cb av_call_state_callback,
+    toxw_av_audio_frame_cb av_audio_frame_callback
+);
+
+void toxw_set_group_callbacks(
+    ToxWrapper *wrapper,
+    toxw_group_message_cb group_message_callback,
+    toxw_group_invite_cb group_invite_callback,
+    toxw_group_peer_name_cb group_peer_name_callback,
+    toxw_group_peer_join_cb group_peer_join_callback,
+    toxw_group_peer_exit_cb group_peer_exit_callback
 );
 
 void toxw_iterate(ToxWrapper *wrapper);
@@ -111,6 +135,109 @@ bool toxw_file_send_chunk(
     uint64_t position,
     const uint8_t *data,
     size_t length,
+    int32_t *out_error_code
+);
+
+bool toxw_av_call(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    uint32_t audio_bit_rate,
+    uint32_t video_bit_rate,
+    int32_t *out_error_code
+);
+
+bool toxw_av_answer(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    uint32_t audio_bit_rate,
+    uint32_t video_bit_rate,
+    int32_t *out_error_code
+);
+
+bool toxw_av_call_control(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    uint32_t control,
+    int32_t *out_error_code
+);
+
+bool toxw_av_audio_send_frame(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    const int16_t *pcm,
+    size_t sample_count,
+    uint8_t channels,
+    uint32_t sampling_rate,
+    int32_t *out_error_code
+);
+
+uint32_t toxw_group_chat_id_size(void);
+
+bool toxw_group_new_public(
+    ToxWrapper *wrapper,
+    const uint8_t *group_name,
+    size_t group_name_length,
+    const uint8_t *self_name,
+    size_t self_name_length,
+    uint32_t *out_group_number,
+    int32_t *out_error_code
+);
+
+bool toxw_group_join_by_chat_id(
+    ToxWrapper *wrapper,
+    const uint8_t *chat_id,
+    size_t chat_id_length,
+    const uint8_t *self_name,
+    size_t self_name_length,
+    uint32_t *out_group_number,
+    int32_t *out_error_code
+);
+
+bool toxw_group_leave(
+    ToxWrapper *wrapper,
+    uint32_t group_number,
+    int32_t *out_error_code
+);
+
+uint32_t toxw_group_chatlist_size(const ToxWrapper *wrapper);
+
+uint32_t toxw_group_chatlist(
+    const ToxWrapper *wrapper,
+    uint32_t *out_group_numbers,
+    uint32_t capacity
+);
+
+bool toxw_group_get_chat_id(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint8_t *out_chat_id,
+    int32_t *out_error_code
+);
+
+bool toxw_group_send_message(
+    ToxWrapper *wrapper,
+    uint32_t group_number,
+    const uint8_t *message,
+    size_t message_length,
+    int32_t *out_error_code
+);
+
+bool toxw_group_peer_get_name(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint32_t peer_id,
+    uint8_t *out_name,
+    size_t *inout_length
+);
+
+bool toxw_group_invite_accept(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    const uint8_t *invite_data,
+    size_t invite_data_length,
+    const uint8_t *self_name,
+    size_t self_name_length,
+    uint32_t *out_group_number,
     int32_t *out_error_code
 );
 

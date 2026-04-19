@@ -6,6 +6,13 @@ enum ConnectionState: Equatable {
     case online
 }
 
+enum VoiceCallState: Equatable, Sendable {
+    case idle
+    case ringingIncoming
+    case ringingOutgoing
+    case inCall
+}
+
 struct Peer: Identifiable, Hashable, Sendable {
     let id: UUID
     let displayName: String
@@ -76,5 +83,41 @@ struct FileTransferRequest: Identifiable, Hashable, Sendable {
         self.fileNumber = fileNumber
         self.fileName = fileName
         self.fileSize = fileSize
+    }
+}
+
+struct GroupRoom: Identifiable, Hashable, Sendable {
+    let id: UUID
+    let name: String
+    let chatID: String
+    let isHost: Bool
+
+    init(id: UUID = UUID(), name: String, chatID: String, isHost: Bool) {
+        self.id = id
+        self.name = name
+        self.chatID = chatID
+        self.isHost = isHost
+    }
+}
+
+struct GroupInviteRequest: Identifiable, Hashable, Sendable {
+    let id: UUID
+    let inviterName: String
+    let groupName: String
+
+    init(id: UUID = UUID(), inviterName: String, groupName: String) {
+        self.id = id
+        self.inviterName = inviterName
+        self.groupName = groupName
+    }
+}
+
+struct GroupMember: Identifiable, Hashable, Sendable {
+    let id: String
+    let displayName: String
+
+    init(id: String, displayName: String) {
+        self.id = id
+        self.displayName = displayName
     }
 }

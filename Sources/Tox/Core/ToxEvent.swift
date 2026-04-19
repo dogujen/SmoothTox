@@ -2,10 +2,15 @@ import Foundation
 
 enum ToxEvent: Sendable {
     case connectionStateChanged(ConnectionState)
+    case voiceCallStateChanged(peerID: UUID, state: VoiceCallState)
     case selfToxIDUpdated(String)
     case selfDisplayNameUpdated(String)
     case peerAvatarUpdated(peerID: UUID, avatarPath: String)
     case peerAvatarCleared(peerID: UUID)
+    case groupRoomsUpdated([GroupRoom])
+    case groupInvitesUpdated([GroupInviteRequest])
+    case groupMembersUpdated(groupID: UUID, members: [GroupMember])
+    case groupMessageReceived(groupID: UUID, senderName: String, text: String)
     case friendRequestReceived(FriendRequest)
     case fileTransferRequestReceived(FileTransferRequest)
     case fileTransferUpdated(TransferProgress)
@@ -27,4 +32,13 @@ protocol ToxCoreClient: Sendable {
     func rejectFileTransfer(requestID: UUID) async
     func updateDisplayName(_ displayName: String) async -> Bool
     func updateAvatar(path: String?) async -> Bool
+    func startVoiceCall(to peerID: UUID) async -> Bool
+    func acceptVoiceCall(from peerID: UUID) async -> Bool
+    func endVoiceCall(with peerID: UUID) async
+    func hostGroup(named name: String) async -> Bool
+    func joinGroup(invite: String) async -> Bool
+    func leaveGroup(id: UUID) async
+    func sendGroupMessage(_ text: String, to groupID: UUID) async -> Bool
+    func acceptGroupInvite(id: UUID) async -> Bool
+    func rejectGroupInvite(id: UUID) async
 }

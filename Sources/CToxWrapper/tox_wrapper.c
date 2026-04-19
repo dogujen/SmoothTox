@@ -3,9 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <tox/tox.h>
+#include <tox/toxav.h>
 
 struct ToxWrapper {
     Tox *tox;
+    ToxAV *av;
 
     void *swift_user_data;
     toxw_self_connection_status_cb self_connection_status_callback;
@@ -17,7 +19,164 @@ struct ToxWrapper {
     toxw_file_recv_chunk_cb file_recv_chunk_callback;
     toxw_file_chunk_request_cb file_chunk_request_callback;
     toxw_file_recv_control_cb file_recv_control_callback;
+    toxw_group_message_cb group_message_callback;
+    toxw_group_invite_cb group_invite_callback;
+    toxw_group_peer_name_cb group_peer_name_callback;
+    toxw_group_peer_join_cb group_peer_join_callback;
+    toxw_group_peer_exit_cb group_peer_exit_callback;
+    toxw_av_call_cb av_call_callback;
+    toxw_av_call_state_cb av_call_state_callback;
+    toxw_av_audio_frame_cb av_audio_frame_callback;
 };
+
+static void toxw_on_av_call(ToxAV *av, uint32_t friend_number, bool audio_enabled, bool video_enabled, void *user_data) {
+    (void)av;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->av_call_callback == NULL) {
+        return;
+    }
+
+    wrapper->av_call_callback(wrapper->swift_user_data, friend_number, audio_enabled, video_enabled);
+}
+
+static void toxw_on_av_call_state(ToxAV *av, uint32_t friend_number, uint32_t state, void *user_data) {
+    (void)av;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->av_call_state_callback == NULL) {
+        return;
+    }
+
+    wrapper->av_call_state_callback(wrapper->swift_user_data, friend_number, state);
+}
+
+static void toxw_on_av_audio_receive_frame(
+    ToxAV *av,
+    uint32_t friend_number,
+    const int16_t *pcm,
+    size_t sample_count,
+    uint8_t channels,
+    uint32_t sampling_rate,
+    void *user_data
+) {
+    (void)av;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->av_audio_frame_callback == NULL || pcm == NULL || sample_count == 0) {
+        return;
+    }
+
+    wrapper->av_audio_frame_callback(wrapper->swift_user_data, friend_number, pcm, sample_count, channels, sampling_rate);
+}
+
+static void toxw_on_group_message(
+    Tox *tox,
+    uint32_t group_number,
+    uint32_t peer_id,
+    Tox_Message_Type message_type,
+    const uint8_t *message,
+    size_t message_length,
+    uint32_t message_id,
+    void *user_data
+) {
+    (void)tox;
+    (void)message_type;
+    (void)message_id;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->group_message_callback == NULL || message == NULL || message_length == 0) {
+        return;
+    }
+
+    wrapper->group_message_callback(wrapper->swift_user_data, group_number, peer_id, message, message_length);
+}
+
+static void toxw_on_group_invite(
+    Tox *tox,
+    uint32_t friend_number,
+    const uint8_t *invite_data,
+    size_t invite_data_length,
+    const uint8_t *group_name,
+    size_t group_name_length,
+    void *user_data
+) {
+    (void)tox;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->group_invite_callback == NULL || invite_data == NULL || invite_data_length == 0) {
+        return;
+    }
+
+    wrapper->group_invite_callback(
+        wrapper->swift_user_data,
+        friend_number,
+        invite_data,
+        invite_data_length,
+        group_name,
+        group_name_length
+    );
+}
+
+static void toxw_on_group_peer_name(
+    Tox *tox,
+    uint32_t group_number,
+    uint32_t peer_id,
+    const uint8_t *name,
+    size_t name_length,
+    void *user_data
+) {
+    (void)tox;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->group_peer_name_callback == NULL || name == NULL || name_length == 0) {
+        return;
+    }
+
+    wrapper->group_peer_name_callback(wrapper->swift_user_data, group_number, peer_id, name, name_length);
+}
+
+static void toxw_on_group_peer_join(
+    Tox *tox,
+    uint32_t group_number,
+    uint32_t peer_id,
+    void *user_data
+) {
+    (void)tox;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->group_peer_join_callback == NULL) {
+        return;
+    }
+
+    wrapper->group_peer_join_callback(wrapper->swift_user_data, group_number, peer_id);
+}
+
+static void toxw_on_group_peer_exit(
+    Tox *tox,
+    uint32_t group_number,
+    uint32_t peer_id,
+    Tox_Group_Exit_Type exit_type,
+    const uint8_t *name,
+    size_t name_length,
+    const uint8_t *part_message,
+    size_t part_message_length,
+    void *user_data
+) {
+    (void)tox;
+    (void)exit_type;
+    (void)name;
+    (void)name_length;
+    (void)part_message;
+    (void)part_message_length;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->group_peer_exit_callback == NULL) {
+        return;
+    }
+
+    wrapper->group_peer_exit_callback(wrapper->swift_user_data, group_number, peer_id);
+}
 
 static void toxw_on_self_connection_status(Tox *tox, Tox_Connection connection_status, void *user_data) {
     (void)tox;
@@ -213,6 +372,19 @@ static ToxWrapper *toxw_create_internal(
 
     wrapper->tox = tox;
 
+    Toxav_Err_New av_error = TOXAV_ERR_NEW_OK;
+    wrapper->av = toxav_new(tox, &av_error);
+    if (wrapper->av == NULL || av_error != TOXAV_ERR_NEW_OK) {
+        tox_kill(tox);
+        free(wrapper);
+        if (out_error_code != NULL) {
+            *out_error_code = -2;
+        }
+        return NULL;
+    }
+
+    toxav_callback_audio_receive_frame(wrapper->av, toxw_on_av_audio_receive_frame, wrapper);
+
     tox_callback_self_connection_status(tox, toxw_on_self_connection_status);
     tox_callback_friend_connection_status(tox, toxw_on_friend_connection_status);
     tox_callback_friend_name(tox, toxw_on_friend_name);
@@ -222,6 +394,11 @@ static ToxWrapper *toxw_create_internal(
     tox_callback_file_recv_chunk(tox, toxw_on_file_recv_chunk);
     tox_callback_file_chunk_request(tox, toxw_on_file_chunk_request);
     tox_callback_file_recv_control(tox, toxw_on_file_recv_control);
+    tox_callback_group_message(tox, toxw_on_group_message);
+    tox_callback_group_invite(tox, toxw_on_group_invite);
+    tox_callback_group_peer_name(tox, toxw_on_group_peer_name);
+    tox_callback_group_peer_join(tox, toxw_on_group_peer_join);
+    tox_callback_group_peer_exit(tox, toxw_on_group_peer_exit);
 
     if (out_error_code != NULL) {
         *out_error_code = 0;
@@ -252,6 +429,10 @@ ToxWrapper *toxw_create_with_proxy(
 void toxw_destroy(ToxWrapper *wrapper) {
     if (wrapper == NULL) {
         return;
+    }
+
+    if (wrapper->av != NULL) {
+        toxav_kill(wrapper->av);
     }
 
     if (wrapper->tox != NULL) {
@@ -290,12 +471,55 @@ void toxw_set_callbacks(
     wrapper->file_recv_control_callback = file_recv_control_callback;
 }
 
+void toxw_set_av_callbacks(
+    ToxWrapper *wrapper,
+    toxw_av_call_cb av_call_callback,
+    toxw_av_call_state_cb av_call_state_callback,
+    toxw_av_audio_frame_cb av_audio_frame_callback
+) {
+    if (wrapper == NULL) {
+        return;
+    }
+
+    wrapper->av_call_callback = av_call_callback;
+    wrapper->av_call_state_callback = av_call_state_callback;
+    wrapper->av_audio_frame_callback = av_audio_frame_callback;
+
+    if (wrapper->av != NULL) {
+        toxav_callback_call(wrapper->av, toxw_on_av_call, wrapper);
+        toxav_callback_call_state(wrapper->av, toxw_on_av_call_state, wrapper);
+    }
+}
+
+void toxw_set_group_callbacks(
+    ToxWrapper *wrapper,
+    toxw_group_message_cb group_message_callback,
+    toxw_group_invite_cb group_invite_callback,
+    toxw_group_peer_name_cb group_peer_name_callback,
+    toxw_group_peer_join_cb group_peer_join_callback,
+    toxw_group_peer_exit_cb group_peer_exit_callback
+) {
+    if (wrapper == NULL) {
+        return;
+    }
+
+    wrapper->group_message_callback = group_message_callback;
+    wrapper->group_invite_callback = group_invite_callback;
+    wrapper->group_peer_name_callback = group_peer_name_callback;
+    wrapper->group_peer_join_callback = group_peer_join_callback;
+    wrapper->group_peer_exit_callback = group_peer_exit_callback;
+}
+
 void toxw_iterate(ToxWrapper *wrapper) {
     if (wrapper == NULL || wrapper->tox == NULL) {
         return;
     }
 
     tox_iterate(wrapper->tox, wrapper);
+
+    if (wrapper->av != NULL) {
+        toxav_iterate(wrapper->av);
+    }
 }
 
 uint32_t toxw_iteration_interval_ms(const ToxWrapper *wrapper) {
@@ -335,6 +559,13 @@ bool toxw_get_self_address(const ToxWrapper *wrapper, uint8_t *out_address_38) {
 
 bool toxw_set_self_name(ToxWrapper *wrapper, const uint8_t *name, size_t length, int32_t *out_error_code) {
     if (wrapper == NULL || wrapper->tox == NULL || name == NULL || length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    if (length > TOX_MAX_NAME_LENGTH) {
         if (out_error_code != NULL) {
             *out_error_code = -1;
         }
@@ -403,6 +634,9 @@ uint32_t toxw_get_friend_count(const ToxWrapper *wrapper) {
     }
 
     const size_t size = tox_self_get_friend_list_size(wrapper->tox);
+    if (size > UINT32_MAX) {
+        return UINT32_MAX;
+    }
     return (uint32_t)size;
 }
 
@@ -413,6 +647,10 @@ uint32_t toxw_get_friend_list(const ToxWrapper *wrapper, uint32_t *out_friend_nu
 
     const size_t full_size = tox_self_get_friend_list_size(wrapper->tox);
     if (full_size == 0) {
+        return 0;
+    }
+
+    if (full_size > UINT32_MAX || full_size > (SIZE_MAX / sizeof(uint32_t))) {
         return 0;
     }
 
@@ -470,6 +708,13 @@ bool toxw_send_message(
     int32_t *out_error_code
 ) {
     if (wrapper == NULL || wrapper->tox == NULL || message == NULL || message_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    if (message_length > TOX_MAX_MESSAGE_LENGTH) {
         if (out_error_code != NULL) {
             *out_error_code = -1;
         }
@@ -547,6 +792,13 @@ bool toxw_add_friend(
         return false;
     }
 
+    if (message_length > TOX_MAX_FRIEND_REQUEST_LENGTH) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
     Tox_Err_Friend_Add add_error = TOX_ERR_FRIEND_ADD_OK;
     const uint32_t friend_number = tox_friend_add(wrapper->tox, address_38, message, message_length, &add_error);
 
@@ -577,6 +829,13 @@ bool toxw_file_send(
     int32_t *out_error_code
 ) {
     if (wrapper == NULL || wrapper->tox == NULL || filename == NULL || filename_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    if (filename_length > TOX_MAX_FILENAME_LENGTH) {
         if (out_error_code != NULL) {
             *out_error_code = -1;
         }
@@ -650,6 +909,13 @@ bool toxw_file_send_chunk(
         return false;
     }
 
+    if (length > 0 && data == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
     Tox_Err_File_Send_Chunk error = TOX_ERR_FILE_SEND_CHUNK_OK;
     const bool ok = tox_file_send_chunk(wrapper->tox, friend_number, file_number, position, data, length, &error);
 
@@ -658,4 +924,379 @@ bool toxw_file_send_chunk(
     }
 
     return ok && error == TOX_ERR_FILE_SEND_CHUNK_OK;
+}
+
+bool toxw_av_call(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    uint32_t audio_bit_rate,
+    uint32_t video_bit_rate,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->av == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Toxav_Err_Call error = TOXAV_ERR_CALL_OK;
+    const bool ok = toxav_call(wrapper->av, friend_number, audio_bit_rate, video_bit_rate, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOXAV_ERR_CALL_OK;
+}
+
+bool toxw_av_answer(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    uint32_t audio_bit_rate,
+    uint32_t video_bit_rate,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->av == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Toxav_Err_Answer error = TOXAV_ERR_ANSWER_OK;
+    const bool ok = toxav_answer(wrapper->av, friend_number, audio_bit_rate, video_bit_rate, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOXAV_ERR_ANSWER_OK;
+}
+
+bool toxw_av_call_control(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    uint32_t control,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->av == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Toxav_Err_Call_Control error = TOXAV_ERR_CALL_CONTROL_OK;
+    const bool ok = toxav_call_control(wrapper->av, friend_number, (Toxav_Call_Control)control, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOXAV_ERR_CALL_CONTROL_OK;
+}
+
+bool toxw_av_audio_send_frame(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    const int16_t *pcm,
+    size_t sample_count,
+    uint8_t channels,
+    uint32_t sampling_rate,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->av == NULL || pcm == NULL || sample_count == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Toxav_Err_Send_Frame error = TOXAV_ERR_SEND_FRAME_OK;
+    const bool ok = toxav_audio_send_frame(wrapper->av, friend_number, pcm, sample_count, channels, sampling_rate, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOXAV_ERR_SEND_FRAME_OK;
+}
+
+uint32_t toxw_group_chat_id_size(void) {
+    return tox_group_chat_id_size();
+}
+
+bool toxw_group_new_public(
+    ToxWrapper *wrapper,
+    const uint8_t *group_name,
+    size_t group_name_length,
+    const uint8_t *self_name,
+    size_t self_name_length,
+    uint32_t *out_group_number,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || group_name == NULL || self_name == NULL || group_name_length == 0 || self_name_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_New error = TOX_ERR_GROUP_NEW_OK;
+    const uint32_t group_number = tox_group_new(
+        wrapper->tox,
+        TOX_GROUP_PRIVACY_STATE_PUBLIC,
+        group_name,
+        group_name_length,
+        self_name,
+        self_name_length,
+        &error
+    );
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    if (error != TOX_ERR_GROUP_NEW_OK || group_number == UINT32_MAX) {
+        return false;
+    }
+
+    if (out_group_number != NULL) {
+        *out_group_number = group_number;
+    }
+
+    return true;
+}
+
+bool toxw_group_join_by_chat_id(
+    ToxWrapper *wrapper,
+    const uint8_t *chat_id,
+    size_t chat_id_length,
+    const uint8_t *self_name,
+    size_t self_name_length,
+    uint32_t *out_group_number,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || chat_id == NULL || self_name == NULL || self_name_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    if (chat_id_length != tox_group_chat_id_size()) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_Join error = TOX_ERR_GROUP_JOIN_OK;
+    const uint32_t group_number = tox_group_join(
+        wrapper->tox,
+        chat_id,
+        self_name,
+        self_name_length,
+        NULL,
+        0,
+        &error
+    );
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    if (error != TOX_ERR_GROUP_JOIN_OK || group_number == UINT32_MAX) {
+        return false;
+    }
+
+    if (out_group_number != NULL) {
+        *out_group_number = group_number;
+    }
+
+    return true;
+}
+
+bool toxw_group_leave(
+    ToxWrapper *wrapper,
+    uint32_t group_number,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_Leave error = TOX_ERR_GROUP_LEAVE_OK;
+    const bool ok = tox_group_leave(wrapper->tox, group_number, NULL, 0, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOX_ERR_GROUP_LEAVE_OK;
+}
+
+uint32_t toxw_group_chatlist_size(const ToxWrapper *wrapper) {
+    if (wrapper == NULL || wrapper->tox == NULL) {
+        return 0;
+    }
+
+    return tox_group_get_number_groups(wrapper->tox);
+}
+
+uint32_t toxw_group_chatlist(
+    const ToxWrapper *wrapper,
+    uint32_t *out_group_numbers,
+    uint32_t capacity
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || out_group_numbers == NULL || capacity == 0) {
+        return 0;
+    }
+
+    const uint32_t full_size = tox_group_get_number_groups(wrapper->tox);
+    if (full_size == 0) {
+        return 0;
+    }
+
+    const uint32_t copy_count = full_size < capacity ? full_size : capacity;
+    for (uint32_t index = 0; index < copy_count; index++) {
+        out_group_numbers[index] = index;
+    }
+
+    return copy_count;
+}
+
+bool toxw_group_get_chat_id(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint8_t *out_chat_id,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || out_chat_id == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_State_Query error = TOX_ERR_GROUP_STATE_QUERY_OK;
+    const bool ok = tox_group_get_chat_id(wrapper->tox, group_number, out_chat_id, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOX_ERR_GROUP_STATE_QUERY_OK;
+}
+
+bool toxw_group_send_message(
+    ToxWrapper *wrapper,
+    uint32_t group_number,
+    const uint8_t *message,
+    size_t message_length,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || message == NULL || message_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_Send_Message error = TOX_ERR_GROUP_SEND_MESSAGE_OK;
+    const bool ok = tox_group_send_message(
+        wrapper->tox,
+        group_number,
+        TOX_MESSAGE_TYPE_NORMAL,
+        message,
+        message_length,
+        &error
+    );
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOX_ERR_GROUP_SEND_MESSAGE_OK;
+}
+
+bool toxw_group_peer_get_name(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint32_t peer_id,
+    uint8_t *out_name,
+    size_t *inout_length
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || out_name == NULL || inout_length == NULL) {
+        return false;
+    }
+
+    Tox_Err_Group_Peer_Query size_error = TOX_ERR_GROUP_PEER_QUERY_OK;
+    const size_t required = tox_group_peer_get_name_size(wrapper->tox, group_number, peer_id, &size_error);
+    if (size_error != TOX_ERR_GROUP_PEER_QUERY_OK || required == 0) {
+        return false;
+    }
+
+    if (*inout_length < required) {
+        *inout_length = required;
+        return false;
+    }
+
+    Tox_Err_Group_Peer_Query get_error = TOX_ERR_GROUP_PEER_QUERY_OK;
+    const bool ok = tox_group_peer_get_name(wrapper->tox, group_number, peer_id, out_name, &get_error);
+    if (!ok || get_error != TOX_ERR_GROUP_PEER_QUERY_OK) {
+        return false;
+    }
+
+    *inout_length = required;
+    return true;
+}
+
+bool toxw_group_invite_accept(
+    ToxWrapper *wrapper,
+    uint32_t friend_number,
+    const uint8_t *invite_data,
+    size_t invite_data_length,
+    const uint8_t *self_name,
+    size_t self_name_length,
+    uint32_t *out_group_number,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || invite_data == NULL || invite_data_length == 0 || self_name == NULL || self_name_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_Invite_Accept error = TOX_ERR_GROUP_INVITE_ACCEPT_OK;
+    const uint32_t group_number = tox_group_invite_accept(
+        wrapper->tox,
+        friend_number,
+        invite_data,
+        invite_data_length,
+        self_name,
+        self_name_length,
+        NULL,
+        0,
+        &error
+    );
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    if (error != TOX_ERR_GROUP_INVITE_ACCEPT_OK || group_number == UINT32_MAX) {
+        return false;
+    }
+
+    if (out_group_number != NULL) {
+        *out_group_number = group_number;
+    }
+
+    return true;
 }

@@ -17,6 +17,12 @@ private struct OutgoingFileContext {
     let fileSize: UInt64
 }
 
+private struct PendingGroupInviteContext {
+    let request: GroupInviteRequest
+    let friendNumber: UInt32
+    let inviteData: Data
+}
+
 private let toxSelfConnectionCallback: toxw_self_connection_status_cb = { swiftUserData, connectionStatus in
     guard let swiftUserData else { return }
     let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
@@ -109,6 +115,91 @@ private let toxFileRecvControlCallback: toxw_file_recv_control_cb = { swiftUserD
     }
 }
 
+private let toxAVCallCallback: toxw_av_call_cb = { swiftUserData, friendNumber, _, _ in
+    guard let swiftUserData else { return }
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    Task {
+        await actor.onIncomingCall(friendNumber: friendNumber)
+    }
+}
+
+private let toxAVCallStateCallback: toxw_av_call_state_cb = { swiftUserData, friendNumber, state in
+    guard let swiftUserData else { return }
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    Task {
+        await actor.onCallStateChanged(friendNumber: friendNumber, state: state)
+    }
+}
+
+private let toxAVAudioFrameCallback: toxw_av_audio_frame_cb = { swiftUserData, friendNumber, pcm, sampleCount, channels, samplingRate in
+    guard let swiftUserData, let pcm, sampleCount > 0 else { return }
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    let total = Int(sampleCount) * Int(channels)
+    let frame = Array(UnsafeBufferPointer(start: pcm, count: total))
+
+    Task {
+        await actor.onAudioFrameReceived(friendNumber: friendNumber, samples: frame, sampleCount: Int(sampleCount), channels: channels, sampleRate: samplingRate)
+    }
+}
+
+private let toxGroupMessageCallback: toxw_group_message_cb = { swiftUserData, groupNumber, peerID, message, messageLength in
+    guard let swiftUserData, let message, messageLength > 0 else { return }
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    let data = Data(bytes: message, count: Int(messageLength))
+    let text = String(data: data, encoding: .utf8) ?? ""
+
+    Task {
+        await actor.onGroupMessage(groupNumber: groupNumber, peerID: peerID, text: text)
+    }
+}
+
+private let toxGroupInviteCallback: toxw_group_invite_cb = { swiftUserData, friendNumber, inviteDataBytes, inviteDataLength, groupNameBytes, groupNameLength in
+    guard let swiftUserData,
+          let inviteDataBytes,
+          inviteDataLength > 0 else { return }
+
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    let inviteData = Data(bytes: inviteDataBytes, count: Int(inviteDataLength))
+    let groupNameData = groupNameBytes.map { Data(bytes: $0, count: Int(groupNameLength)) } ?? Data()
+    let groupName = String(data: groupNameData, encoding: .utf8) ?? ""
+
+    Task {
+        await actor.onGroupInvite(friendNumber: friendNumber, inviteData: inviteData, groupName: groupName)
+    }
+}
+
+private let toxGroupPeerNameCallback: toxw_group_peer_name_cb = { swiftUserData, groupNumber, peerID, nameBytes, nameLength in
+    guard let swiftUserData,
+          let nameBytes,
+          nameLength > 0 else { return }
+
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    let nameData = Data(bytes: nameBytes, count: Int(nameLength))
+    let name = String(data: nameData, encoding: .utf8) ?? ""
+
+    Task {
+        await actor.onGroupPeerNameChanged(groupNumber: groupNumber, peerID: peerID, name: name)
+    }
+}
+
+private let toxGroupPeerJoinCallback: toxw_group_peer_join_cb = { swiftUserData, groupNumber, peerID in
+    guard let swiftUserData else { return }
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+
+    Task {
+        await actor.onGroupPeerJoined(groupNumber: groupNumber, peerID: peerID)
+    }
+}
+
+private let toxGroupPeerExitCallback: toxw_group_peer_exit_cb = { swiftUserData, groupNumber, peerID in
+    guard let swiftUserData else { return }
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+
+    Task {
+        await actor.onGroupPeerExited(groupNumber: groupNumber, peerID: peerID)
+    }
+}
+
 actor ToxCoreActor: ToxCoreClient {
     let events: AsyncStream<ToxEvent>
 
@@ -123,14 +214,25 @@ actor ToxCoreActor: ToxCoreClient {
     private var incomingFiles: [String: IncomingFileContext] = [:]
     private var outgoingFiles: [String: OutgoingFileContext] = [:]
     private var pendingOutboundMessages: [UInt32: [String]] = [:]
+    private var voiceCallStates: [UUID: VoiceCallState] = [:]
+    private var groupRooms: [GroupRoom] = []
+    private var groupNumberToRoomID: [UInt32: UUID] = [:]
+    private var pendingGroupInvites: [UUID: PendingGroupInviteContext] = [:]
+    private var groupPeerNames: [UInt32: [UInt32: String]] = [:]
+    private var activeCallFriendNumber: UInt32?
     private let appConfig = BootstrapConfigLoader.loadFromBundle()
+    private let l10n = AppLocalizer.shared
     private let userProfileStore = UserProfileStore()
     private var selfAvatarPath: String?
+    private var selfDisplayNameCache: String = "SmoothTox"
+    private let callAudioEngine = CallAudioEngine()
     private var isRunning = false
     private let avatarFilePrefix = "smoothtox-avatar-v1"
     private let avatarClearControlMessage = "[[SMOOTHTOX_AVATAR_CLEAR_V1]]"
     private let toxFileKindData: UInt32 = 0
     private let toxFileKindAvatar: UInt32 = 1
+    private let toxavCallStateError: UInt32 = 1
+    private let toxavCallStateFinished: UInt32 = 2
 
     init() {
         var continuation: AsyncStream<ToxEvent>.Continuation?
@@ -207,12 +309,23 @@ actor ToxCoreActor: ToxCoreClient {
             toxFileChunkRequestCallback,
             toxFileRecvControlCallback
         )
+        toxw_set_av_callbacks(handle, toxAVCallCallback, toxAVCallStateCallback, toxAVAudioFrameCallback)
+        toxw_set_group_callbacks(
+            handle,
+            toxGroupMessageCallback,
+            toxGroupInviteCallback,
+            toxGroupPeerNameCallback,
+            toxGroupPeerJoinCallback,
+            toxGroupPeerExitCallback
+        )
 
         bootstrapFromConfig()
         emitSelfAddressIfAvailable()
         emitSelfDisplayNameIfAvailable()
         selfAvatarPath = userProfileStore.loadAvatarPath()
         refreshPeerList()
+        refreshGroupRooms()
+        emit(.groupInvitesUpdated([]))
 
         loopTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -238,8 +351,17 @@ actor ToxCoreActor: ToxCoreClient {
         incomingFiles.removeAll()
         outgoingFiles.removeAll()
         pendingOutboundMessages.removeAll()
+        voiceCallStates.removeAll()
+        groupRooms.removeAll()
+        groupNumberToRoomID.removeAll()
+        pendingGroupInvites.removeAll()
+        groupPeerNames.removeAll()
+        activeCallFriendNumber = nil
+        callAudioEngine.stopCapture()
 
         eventContinuation.yield(.peerListUpdated([]))
+        eventContinuation.yield(.groupRoomsUpdated([]))
+        eventContinuation.yield(.groupInvitesUpdated([]))
         eventContinuation.yield(.connectionStateChanged(.offline))
     }
 
@@ -410,6 +532,234 @@ actor ToxCoreActor: ToxCoreClient {
         return didQueueOrSend || friendNumbers.isEmpty
     }
 
+    func startVoiceCall(to peerID: UUID) async -> Bool {
+        guard isRunning,
+              let handle = toxHandle,
+              let friendNumber = peerToFriend[peerID] else {
+            return false
+        }
+
+        var error: Int32 = 0
+        let ok = toxw_av_call(handle, friendNumber, 64, 0, &error)
+        if ok, error == 0 {
+            voiceCallStates[peerID] = .ringingOutgoing
+            emit(.voiceCallStateChanged(peerID: peerID, state: .ringingOutgoing))
+            return true
+        }
+
+        return false
+    }
+
+    func acceptVoiceCall(from peerID: UUID) async -> Bool {
+        guard isRunning,
+              let handle = toxHandle,
+              let friendNumber = peerToFriend[peerID] else {
+            return false
+        }
+
+        var error: Int32 = 0
+        let ok = toxw_av_answer(handle, friendNumber, 64, 0, &error)
+        if ok, error == 0 {
+            voiceCallStates[peerID] = .inCall
+            emit(.voiceCallStateChanged(peerID: peerID, state: .inCall))
+            activeCallFriendNumber = friendNumber
+            startAudioCaptureIfNeeded(for: friendNumber)
+            return true
+        }
+
+        return false
+    }
+
+    func endVoiceCall(with peerID: UUID) async {
+        guard isRunning,
+              let handle = toxHandle,
+              let friendNumber = peerToFriend[peerID] else {
+            return
+        }
+
+        var error: Int32 = 0
+        _ = toxw_av_call_control(handle, friendNumber, 2, &error)
+        voiceCallStates[peerID] = .idle
+        emit(.voiceCallStateChanged(peerID: peerID, state: .idle))
+        if activeCallFriendNumber == friendNumber {
+            activeCallFriendNumber = nil
+            callAudioEngine.stopCapture()
+        }
+    }
+
+    func hostGroup(named name: String) async -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let handle = toxHandle,
+              let selfName = currentSelfNameData() else { return false }
+
+        let groupName = Data(trimmed.utf8)
+        var groupNumber: UInt32 = 0
+        var error: Int32 = 0
+
+        let created = groupName.withUnsafeBytes { groupBuffer in
+            selfName.withUnsafeBytes { selfBuffer in
+                guard let groupBase = groupBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let selfBase = selfBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return false
+                }
+
+                return toxw_group_new_public(
+                    handle,
+                    groupBase,
+                    groupBuffer.count,
+                    selfBase,
+                    selfBuffer.count,
+                    &groupNumber,
+                    &error
+                )
+            }
+        }
+
+        guard created, error == 0 else { return false }
+
+        refreshGroupRooms()
+        if let roomID = groupNumberToRoomID[groupNumber],
+           let index = groupRooms.firstIndex(where: { $0.id == roomID }) {
+            let room = groupRooms[index]
+            groupRooms[index] = GroupRoom(id: room.id, name: trimmed, chatID: room.chatID, isHost: true)
+            emit(.groupRoomsUpdated(groupRooms))
+        }
+
+        return true
+    }
+
+    func joinGroup(invite: String) async -> Bool {
+        let trimmed = invite.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let handle = toxHandle,
+              let selfName = currentSelfNameData(),
+              let chatID = Data(hexString: trimmed),
+              chatID.count == Int(toxw_group_chat_id_size()) else { return false }
+
+        var groupNumber: UInt32 = 0
+        var error: Int32 = 0
+
+        let joined = chatID.withUnsafeBytes { chatBuffer in
+            selfName.withUnsafeBytes { selfBuffer in
+                guard let chatBase = chatBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let selfBase = selfBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return false
+                }
+
+                return toxw_group_join_by_chat_id(
+                    handle,
+                    chatBase,
+                    chatBuffer.count,
+                    selfBase,
+                    selfBuffer.count,
+                    &groupNumber,
+                    &error
+                )
+            }
+        }
+
+        guard joined, error == 0 else { return false }
+
+        refreshGroupRooms()
+        return true
+    }
+
+    func leaveGroup(id: UUID) async {
+        guard let groupNumber = groupNumberToRoomID.first(where: { $0.value == id })?.key,
+              let handle = toxHandle else {
+            return
+        }
+
+        var error: Int32 = 0
+        _ = toxw_group_leave(handle, groupNumber, &error)
+        refreshGroupRooms()
+    }
+
+    func sendGroupMessage(_ text: String, to groupID: UUID) async -> Bool {
+        guard let groupNumber = groupNumberToRoomID.first(where: { $0.value == groupID })?.key,
+              let handle = toxHandle else {
+            return false
+        }
+
+        let messageData = Data(text.utf8)
+        if messageData.isEmpty { return false }
+
+        var error: Int32 = 0
+        let ok = messageData.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
+            }
+            return toxw_group_send_message(handle, groupNumber, base, buffer.count, &error)
+        }
+
+        return ok && error == 0
+    }
+
+    func acceptGroupInvite(id: UUID) async -> Bool {
+        guard let pending = pendingGroupInvites[id],
+              let handle = toxHandle,
+              let selfName = currentSelfNameData() else {
+            return false
+        }
+
+        var groupNumber: UInt32 = 0
+        var error: Int32 = 0
+
+        let accepted = pending.inviteData.withUnsafeBytes { inviteBuffer in
+            selfName.withUnsafeBytes { selfBuffer in
+                guard let inviteBase = inviteBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let selfBase = selfBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return false
+                }
+
+                return toxw_group_invite_accept(
+                    handle,
+                    pending.friendNumber,
+                    inviteBase,
+                    inviteBuffer.count,
+                    selfBase,
+                    selfBuffer.count,
+                    &groupNumber,
+                    &error
+                )
+            }
+        }
+
+        guard accepted, error == 0 else { return false }
+
+        pendingGroupInvites.removeValue(forKey: id)
+        emitPendingGroupInvites()
+
+        refreshGroupRooms()
+        if let roomID = groupNumberToRoomID[groupNumber],
+           let index = groupRooms.firstIndex(where: { $0.id == roomID }) {
+            let room = groupRooms[index]
+            groupRooms[index] = GroupRoom(id: room.id, name: pending.request.groupName, chatID: room.chatID, isHost: room.isHost)
+            emit(.groupRoomsUpdated(groupRooms))
+        } else {
+            let provisionalID = UUID()
+            groupNumberToRoomID[groupNumber] = provisionalID
+            let provisional = GroupRoom(
+                id: provisionalID,
+                name: pending.request.groupName,
+                chatID: "",
+                isHost: false
+            )
+            groupRooms.append(provisional)
+            emit(.groupRoomsUpdated(groupRooms))
+        }
+
+        await refreshGroupRoomsWithRetry()
+
+        return true
+    }
+
+    func rejectGroupInvite(id: UUID) async {
+        pendingGroupInvites.removeValue(forKey: id)
+        emitPendingGroupInvites()
+    }
+
     private func sendFile(handle: OpaquePointer, friendNumber: UInt32, url: URL, fileNameOverride: String?, fileKind: UInt32) -> Bool {
         let fileName = fileNameOverride ?? url.lastPathComponent
         let nameData = Data(fileName.utf8)
@@ -490,6 +840,7 @@ actor ToxCoreActor: ToxCoreClient {
         }
 
         if ok {
+            selfDisplayNameCache = trimmed
             emit(.selfDisplayNameUpdated(trimmed))
             persistSavedata()
         }
@@ -512,9 +863,19 @@ actor ToxCoreActor: ToxCoreClient {
         pendingFileRequests.removeAll()
         incomingFiles.removeAll()
         outgoingFiles.removeAll()
+        pendingOutboundMessages.removeAll()
+        voiceCallStates.removeAll()
+        groupRooms.removeAll()
+        groupNumberToRoomID.removeAll()
+        pendingGroupInvites.removeAll()
+        groupPeerNames.removeAll()
+        activeCallFriendNumber = nil
+        callAudioEngine.stopCapture()
 
         profileStore.resetAll()
         eventContinuation.yield(.peerListUpdated([]))
+        eventContinuation.yield(.groupRoomsUpdated([]))
+        eventContinuation.yield(.groupInvitesUpdated([]))
         eventContinuation.yield(.selfToxIDUpdated("-"))
         eventContinuation.yield(.connectionStateChanged(.offline))
 
@@ -589,6 +950,7 @@ actor ToxCoreActor: ToxCoreClient {
             return
         }
 
+                selfDisplayNameCache = name
         emit(.selfDisplayNameUpdated(name))
     }
 
@@ -738,6 +1100,7 @@ actor ToxCoreActor: ToxCoreClient {
     fileprivate func onFriendConnectionStatus(friendNumber: UInt32, connectionStatus: UInt32) {
         if connectionStatus > 0 {
             refreshPeerList()
+            refreshGroupRooms()
             flushPendingMessages(for: friendNumber)
             sendSelfAvatarIfNeeded(to: friendNumber)
         }
@@ -782,6 +1145,135 @@ actor ToxCoreActor: ToxCoreClient {
     fileprivate func onFriendRequest(publicKeyHex: String, message: String) {
         let request = FriendRequest(publicKeyHex: publicKeyHex, message: message)
         emit(.friendRequestReceived(request))
+    }
+
+    fileprivate func onGroupMessage(groupNumber: UInt32, peerID: UInt32, text: String) {
+        guard let groupID = groupNumberToRoomID[groupNumber], !text.isEmpty else { return }
+        let senderName = resolveGroupPeerName(groupNumber: groupNumber, peerID: peerID)
+        setGroupPeerName(groupNumber: groupNumber, peerID: peerID, name: senderName)
+        emitGroupMembers(for: groupNumber)
+        emit(.groupMessageReceived(groupID: groupID, senderName: senderName, text: text))
+    }
+
+    fileprivate func onGroupInvite(friendNumber: UInt32, inviteData: Data, groupName: String) {
+        guard !inviteData.isEmpty else { return }
+
+        let inviterName = friendToPeer[friendNumber]?.displayName ?? friendFallbackName(friendNumber: friendNumber)
+        let normalizedGroupName = groupName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalGroupName = normalizedGroupName.isEmpty ? l10n.text("group.invite.unknownName") : normalizedGroupName
+
+        let request = GroupInviteRequest(inviterName: inviterName, groupName: finalGroupName)
+        pendingGroupInvites[request.id] = PendingGroupInviteContext(
+            request: request,
+            friendNumber: friendNumber,
+            inviteData: inviteData
+        )
+        emitPendingGroupInvites()
+    }
+
+    fileprivate func onGroupPeerNameChanged(groupNumber: UInt32, peerID: UInt32, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        setGroupPeerName(groupNumber: groupNumber, peerID: peerID, name: trimmed)
+        emitGroupMembers(for: groupNumber)
+    }
+
+    fileprivate func onGroupPeerJoined(groupNumber: UInt32, peerID: UInt32) {
+        let existingName = groupPeerNames[groupNumber]?[peerID]
+        if existingName == nil {
+            setGroupPeerName(groupNumber: groupNumber, peerID: peerID, name: "Peer #\(peerID)")
+            emitGroupMembers(for: groupNumber)
+        }
+    }
+
+    fileprivate func onGroupPeerExited(groupNumber: UInt32, peerID: UInt32) {
+        guard var members = groupPeerNames[groupNumber] else { return }
+        members.removeValue(forKey: peerID)
+        if members.isEmpty {
+            groupPeerNames.removeValue(forKey: groupNumber)
+        } else {
+            groupPeerNames[groupNumber] = members
+        }
+        emitGroupMembers(for: groupNumber)
+    }
+
+    fileprivate func onIncomingCall(friendNumber: UInt32) {
+        guard let peer = friendToPeer[friendNumber] else {
+            refreshPeerList()
+            return
+        }
+
+        voiceCallStates[peer.id] = .ringingIncoming
+        emit(.voiceCallStateChanged(peerID: peer.id, state: .ringingIncoming))
+    }
+
+    fileprivate func onCallStateChanged(friendNumber: UInt32, state: UInt32) {
+        guard let peer = friendToPeer[friendNumber] else {
+            refreshPeerList()
+            return
+        }
+
+        let resolved: VoiceCallState
+        if (state & toxavCallStateError) != 0 || (state & toxavCallStateFinished) != 0 {
+            resolved = .idle
+        } else {
+            resolved = .inCall
+        }
+
+        voiceCallStates[peer.id] = resolved
+        emit(.voiceCallStateChanged(peerID: peer.id, state: resolved))
+
+        if resolved == .inCall {
+            activeCallFriendNumber = friendNumber
+            startAudioCaptureIfNeeded(for: friendNumber)
+        } else if activeCallFriendNumber == friendNumber {
+            activeCallFriendNumber = nil
+            callAudioEngine.stopCapture()
+        }
+    }
+
+    fileprivate func onAudioFrameReceived(friendNumber: UInt32, samples: [Int16], sampleCount: Int, channels: UInt8, sampleRate: UInt32) {
+        if activeCallFriendNumber == nil {
+            activeCallFriendNumber = friendNumber
+        }
+
+        let expected = sampleCount * Int(channels)
+        guard expected > 0, samples.count >= expected else { return }
+        callAudioEngine.playReceived(samples: Array(samples.prefix(expected)), channels: channels, sampleRate: sampleRate)
+    }
+
+    private func startAudioCaptureIfNeeded(for friendNumber: UInt32) {
+        callAudioEngine.startCapture { [weak self] samples, channels, sampleRate in
+            guard let self else { return }
+            Task {
+                await self.sendAudioFrame(friendNumber: friendNumber, samples: samples, channels: channels, sampleRate: sampleRate)
+            }
+        }
+    }
+
+    private func sendAudioFrame(friendNumber: UInt32, samples: [Int16], channels: UInt8, sampleRate: UInt32) {
+        guard let handle = toxHandle,
+              !samples.isEmpty,
+              channels > 0,
+              activeCallFriendNumber == friendNumber else {
+            return
+        }
+
+        let perChannelSamples = samples.count / Int(channels)
+        guard perChannelSamples > 0 else { return }
+
+        var error: Int32 = 0
+        _ = samples.withUnsafeBufferPointer { ptr in
+            toxw_av_audio_send_frame(
+                handle,
+                friendNumber,
+                ptr.baseAddress,
+                perChannelSamples,
+                channels,
+                sampleRate,
+                &error
+            )
+        }
     }
 
     fileprivate func onFileTransferRequest(friendNumber: UInt32, fileNumber: UInt32, kind: UInt32, fileName: String, fileSize: UInt64) {
@@ -831,9 +1323,10 @@ actor ToxCoreActor: ToxCoreClient {
             }
 
             let savedPath = context.destinationURL.path
+            let receivedText = l10n.format("message.file.received", context.request.fileName)
             let incomingMessage = ChatMessage(
                 peerID: context.request.peerID,
-                text: "Dosya alındı: \(context.request.fileName)\n\(savedPath)",
+                text: "\(receivedText)\n\(savedPath)",
                 isOutgoing: false,
                 attachmentURL: context.destinationURL
             )
@@ -927,6 +1420,153 @@ actor ToxCoreActor: ToxCoreClient {
         let allowed = ["png", "jpg", "jpeg", "webp", "heic", "heif", "gif", "bmp", "tiff"]
         if ext.isEmpty || allowed.contains(ext) { return url }
         return nil
+    }
+
+    private func currentSelfNameData() -> Data? {
+        let trimmed = selfDisplayNameCache.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return Data("SmoothTox".utf8)
+        }
+        return Data(trimmed.utf8)
+    }
+
+    private func refreshGroupRooms() {
+        guard let handle = toxHandle else {
+            groupRooms = []
+            groupNumberToRoomID = [:]
+            groupPeerNames = [:]
+            emit(.groupRoomsUpdated([]))
+            return
+        }
+
+        let count = Int(toxw_group_chatlist_size(handle))
+        guard count > 0 else {
+            groupRooms = []
+            groupNumberToRoomID = [:]
+            groupPeerNames = [:]
+            emit(.groupRoomsUpdated([]))
+            return
+        }
+
+        var groupNumbers = [UInt32](repeating: 0, count: count)
+        let copied = Int(groupNumbers.withUnsafeMutableBufferPointer { buffer in
+            toxw_group_chatlist(handle, buffer.baseAddress, UInt32(buffer.count))
+        })
+
+        let chatIDSize = Int(toxw_group_chat_id_size())
+        guard chatIDSize > 0 else {
+            groupRooms = []
+            groupNumberToRoomID = [:]
+            groupPeerNames = [:]
+            emit(.groupRoomsUpdated([]))
+            return
+        }
+
+        var nextRooms: [GroupRoom] = []
+        var nextMap: [UInt32: UUID] = [:]
+
+        for groupNumber in groupNumbers.prefix(copied) {
+            var chatID = [UInt8](repeating: 0, count: chatIDSize)
+            var error: Int32 = 0
+            let ok = chatID.withUnsafeMutableBufferPointer { ptr in
+                toxw_group_get_chat_id(handle, groupNumber, ptr.baseAddress, &error)
+            }
+
+            guard ok, error == 0 else { continue }
+
+            let chatIDHex = Data(chatID).hexUppercasedString()
+            let roomID = groupNumberToRoomID[groupNumber] ?? UUID()
+            nextMap[groupNumber] = roomID
+
+            let existingRoom = groupRooms.first(where: { $0.id == roomID })
+            let existingName = existingRoom?.name
+            let fallbackName = "Group \(chatIDHex.prefix(10))"
+            let room = GroupRoom(
+                id: roomID,
+                name: existingName ?? fallbackName,
+                chatID: chatIDHex,
+                isHost: existingRoom?.isHost ?? false
+            )
+            nextRooms.append(room)
+        }
+
+        groupRooms = nextRooms
+        groupNumberToRoomID = nextMap
+        let activeNumbers = Set(nextMap.keys)
+        groupPeerNames = groupPeerNames.filter { activeNumbers.contains($0.key) }
+        emit(.groupRoomsUpdated(nextRooms))
+        for groupNumber in nextMap.keys {
+            emitGroupMembers(for: groupNumber)
+        }
+    }
+
+    private func emitPendingGroupInvites() {
+        let ordered = pendingGroupInvites.values
+            .map(\.request)
+            .sorted { lhs, rhs in
+                if lhs.groupName == rhs.groupName {
+                    return lhs.inviterName < rhs.inviterName
+                }
+                return lhs.groupName < rhs.groupName
+            }
+        emit(.groupInvitesUpdated(ordered))
+    }
+
+    private func resolveGroupPeerName(groupNumber: UInt32, peerID: UInt32) -> String {
+        guard let handle = toxHandle else { return "Peer #\(peerID)" }
+
+        var size: Int = 128
+        var bytes = [UInt8](repeating: 0, count: size)
+        let success = bytes.withUnsafeMutableBufferPointer { buffer in
+            toxw_group_peer_get_name(handle, groupNumber, peerID, buffer.baseAddress, &size)
+        }
+
+        if !success, size > bytes.count {
+            bytes = [UInt8](repeating: 0, count: size)
+            let retried = bytes.withUnsafeMutableBufferPointer { buffer in
+                toxw_group_peer_get_name(handle, groupNumber, peerID, buffer.baseAddress, &size)
+            }
+            guard retried else { return "Peer #\(peerID)" }
+        } else if !success {
+            return "Peer #\(peerID)"
+        }
+
+        guard size > 0,
+              size <= bytes.count,
+              let name = String(data: Data(bytes[0..<size]), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            return "Peer #\(peerID)"
+        }
+
+        return name
+    }
+
+    private func setGroupPeerName(groupNumber: UInt32, peerID: UInt32, name: String) {
+        var members = groupPeerNames[groupNumber, default: [:]]
+        members[peerID] = name
+        groupPeerNames[groupNumber] = members
+    }
+
+    private func emitGroupMembers(for groupNumber: UInt32) {
+        guard let groupID = groupNumberToRoomID[groupNumber] else { return }
+
+        let remoteMembers = (groupPeerNames[groupNumber] ?? [:])
+            .sorted { lhs, rhs in
+                lhs.value.localizedCaseInsensitiveCompare(rhs.value) == .orderedAscending
+            }
+            .map { GroupMember(id: "\($0.key)", displayName: $0.value) }
+
+        let selfMember = GroupMember(id: "self", displayName: selfDisplayNameCache)
+        emit(.groupMembersUpdated(groupID: groupID, members: [selfMember] + remoteMembers))
+    }
+
+    private func refreshGroupRoomsWithRetry() async {
+        let delays: [UInt64] = [250, 600, 1200, 2200]
+        for delay in delays {
+            try? await Task.sleep(for: .milliseconds(Int(delay)))
+            if !isRunning { return }
+            refreshGroupRooms()
+        }
     }
 
     private func avatarFileName(for url: URL) -> String {
