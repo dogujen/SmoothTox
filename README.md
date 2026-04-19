@@ -1,29 +1,39 @@
 # SmoothTox
 
-Minimal, modern bir macOS Tox istemcisi.
+A minimal, modern Tox client for macOS.
 
-![SmoothTox Önizleme](docs/assets/smoothtox-cover.png)
+![SmoothTox Preview](docs/assets/smoothtox-cover.png)
 
-## Özellikler
-- Gerçek `libtoxcore` entegrasyonu
-- Uçtan uca mesajlaşma ve dosya transferi
-- Profil adı/avatar yönetimi
-- Tor / proxy desteği
-- SwiftUI + AppKit masaüstü deneyimi
+## Feature Table
 
-## Hızlı Başlangıç
+| Feature | Description | Status |
+|---|---|---|
+| Core Tox Integration | Native integration with `libtoxcore` via C wrapper | ✅ |
+| Private Messaging | End-to-end encrypted 1:1 text messaging | ✅ |
+| Group Chats | Host, join, invite accept, and group messaging | ✅ |
+| Group Member List | Live member display in selected group chat | ✅ |
+| Voice Calls | Basic ToxAV voice call support | ✅ |
+| File Transfer | Send/receive files with progress updates | ✅ |
+| Avatar Sync | Profile avatar send/receive between peers | ✅ |
+| Localization | JSON-based runtime localization (`en`, `tr`) | ✅ |
+| Search | Peer/group list search and in-chat message search | ✅ |
+| Proxy Support | Tor / SOCKS / HTTP proxy support via config | ✅ |
+| Profile Storage | Encrypted profile storage with SQLite + Keychain | ✅ |
+| macOS UX | Native desktop app using SwiftUI + AppKit | ✅ |
+
+## Quick Start
 ```bash
 brew install toxcore
 swift build
 swift run
 ```
 
-## DMG Üretimi
+## Build DMG
 ```bash
 ./scripts/make-dmg.sh
 ```
 
-Çıktı: `dist/SmoothTox.dmg`
+Output: `dist/SmoothTox.dmg`
 
-## Repo
+## Repository
 `dogujen/smoothtox`
