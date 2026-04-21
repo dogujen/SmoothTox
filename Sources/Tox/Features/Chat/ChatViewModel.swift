@@ -12,6 +12,8 @@ final class ChatViewModel {
     private let peerAvatarStore = PeerAvatarStore()
     private let l10n = AppLocalizer.shared
     private var eventTask: Task<Void, Never>?
+    private var incomingCallRingtoneTimer: Timer?
+    private var ringtoneSound: NSSound?
 
     var peers: [Peer] = []
     var selectedPeerID: UUID?
@@ -120,6 +122,7 @@ final class ChatViewModel {
     func shutdown() {
         eventTask?.cancel()
         eventTask = nil
+        stopIncomingCallRingtone()
 
         Task {
             await toxClient.stop()
@@ -193,6 +196,22 @@ final class ChatViewModel {
         return voiceCallStates[selectedPeerID] ?? .idle
     }
 
+    var incomingCallPeerID: UUID? {
+        voiceCallStates.first(where: { $0.value == .ringingIncoming })?.key
+    }
+
+    var incomingCallPeerName: String {
+        guard let incomingCallPeerID,
+              let peer = peers.first(where: { $0.id == incomingCallPeerID }) else {
+            return l10n.text("call.unknownCaller")
+        }
+        return peer.displayName
+    }
+
+    var isIncomingCallPopupVisible: Bool {
+        incomingCallPeerID != nil
+    }
+
     func startCallWithSelectedPeer() {
         guard let selectedPeerID else { return }
         Task {
@@ -204,6 +223,21 @@ final class ChatViewModel {
         guard let selectedPeerID else { return }
         Task {
             _ = await toxClient.acceptVoiceCall(from: selectedPeerID)
+        }
+    }
+
+    func acceptIncomingCallFromPopup() {
+        guard let incomingCallPeerID else { return }
+        selectPeer(incomingCallPeerID)
+        Task {
+            _ = await toxClient.acceptVoiceCall(from: incomingCallPeerID)
+        }
+    }
+
+    func declineIncomingCallFromPopup() {
+        guard let incomingCallPeerID else { return }
+        Task {
+            await toxClient.endVoiceCall(with: incomingCallPeerID)
         }
     }
 
@@ -399,6 +433,7 @@ final class ChatViewModel {
 
         case .voiceCallStateChanged(let peerID, let state):
             voiceCallStates[peerID] = state
+            updateIncomingCallRingtoneState()
 
         case .selfDisplayNameUpdated(let displayName):
             selfDisplayName = displayName
@@ -470,5 +505,41 @@ final class ChatViewModel {
         case .fileTransferUpdated(let progress):
             activeTransferProgress = progress.progress
         }
+    }
+
+    private func updateIncomingCallRingtoneState() {
+        if incomingCallPeerID != nil {
+            startIncomingCallRingtoneIfNeeded()
+        } else {
+            stopIncomingCallRingtone()
+        }
+    }
+
+    private func startIncomingCallRingtoneIfNeeded() {
+        if incomingCallRingtoneTimer != nil { return }
+
+        let sound = NSSound(named: NSSound.Name("Submarine")) ?? NSSound(named: NSSound.Name("Glass"))
+        ringtoneSound = sound
+        sound?.stop()
+        sound?.play()
+
+        incomingCallRingtoneTimer = Timer.scheduledTimer(withTimeInterval: 2.4, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.incomingCallPeerID == nil {
+                    self.stopIncomingCallRingtone()
+                    return
+                }
+                self.ringtoneSound?.stop()
+                self.ringtoneSound?.play()
+            }
+        }
+    }
+
+    private func stopIncomingCallRingtone() {
+        incomingCallRingtoneTimer?.invalidate()
+        incomingCallRingtoneTimer = nil
+        ringtoneSound?.stop()
     }
 }

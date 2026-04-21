@@ -219,6 +219,7 @@ actor ToxCoreActor: ToxCoreClient {
     private var groupNumberToRoomID: [UInt32: UUID] = [:]
     private var pendingGroupInvites: [UUID: PendingGroupInviteContext] = [:]
     private var groupPeerNames: [UInt32: [UInt32: String]] = [:]
+    private var hasConnectedOnce = false
     private var activeCallFriendNumber: UInt32?
     private let appConfig = BootstrapConfigLoader.loadFromBundle()
     private let l10n = AppLocalizer.shared
@@ -233,6 +234,7 @@ actor ToxCoreActor: ToxCoreClient {
     private let toxFileKindAvatar: UInt32 = 1
     private let toxavCallStateError: UInt32 = 1
     private let toxavCallStateFinished: UInt32 = 2
+    private let persistedGroupChatIDsKey = "persisted_group_chat_ids_v1"
 
     init() {
         var continuation: AsyncStream<ToxEvent>.Continuation?
@@ -327,6 +329,10 @@ actor ToxCoreActor: ToxCoreClient {
         refreshGroupRooms()
         emit(.groupInvitesUpdated([]))
 
+        Task {
+            await autoRejoinPersistedGroupsIfNeeded()
+        }
+
         loopTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             await self.runIterationLoop()
@@ -356,6 +362,7 @@ actor ToxCoreActor: ToxCoreClient {
         groupNumberToRoomID.removeAll()
         pendingGroupInvites.removeAll()
         groupPeerNames.removeAll()
+        hasConnectedOnce = false
         activeCallFriendNumber = nil
         callAudioEngine.stopCapture()
 
@@ -1093,8 +1100,15 @@ actor ToxCoreActor: ToxCoreClient {
 
     fileprivate func onSelfConnectionStatus(_ connectionStatus: UInt32) {
         let state: ConnectionState = connectionStatus == 0 ? .offline : .online
+        hasConnectedOnce = connectionStatus > 0
         emit(.connectionStateChanged(state))
         emitSelfAddressIfAvailable()
+
+        if connectionStatus > 0 {
+            Task {
+                await autoRejoinPersistedGroupsIfNeeded()
+            }
+        }
     }
 
     fileprivate func onFriendConnectionStatus(friendNumber: UInt32, connectionStatus: UInt32) {
@@ -1435,6 +1449,9 @@ actor ToxCoreActor: ToxCoreClient {
             groupRooms = []
             groupNumberToRoomID = [:]
             groupPeerNames = [:]
+            if hasConnectedOnce {
+                savePersistedGroupChatIDs([])
+            }
             emit(.groupRoomsUpdated([]))
             return
         }
@@ -1444,6 +1461,9 @@ actor ToxCoreActor: ToxCoreClient {
             groupRooms = []
             groupNumberToRoomID = [:]
             groupPeerNames = [:]
+            if hasConnectedOnce {
+                savePersistedGroupChatIDs([])
+            }
             emit(.groupRoomsUpdated([]))
             return
         }
@@ -1458,6 +1478,9 @@ actor ToxCoreActor: ToxCoreClient {
             groupRooms = []
             groupNumberToRoomID = [:]
             groupPeerNames = [:]
+            if hasConnectedOnce {
+                savePersistedGroupChatIDs([])
+            }
             emit(.groupRoomsUpdated([]))
             return
         }
@@ -1495,6 +1518,9 @@ actor ToxCoreActor: ToxCoreClient {
         let activeNumbers = Set(nextMap.keys)
         groupPeerNames = groupPeerNames.filter { activeNumbers.contains($0.key) }
         emit(.groupRoomsUpdated(nextRooms))
+        if hasConnectedOnce {
+            savePersistedGroupChatIDs(nextRooms.map(\ .chatID).filter { !$0.isEmpty })
+        }
         for groupNumber in nextMap.keys {
             emitGroupMembers(for: groupNumber)
         }
@@ -1567,6 +1593,74 @@ actor ToxCoreActor: ToxCoreClient {
             if !isRunning { return }
             refreshGroupRooms()
         }
+    }
+
+    private func autoRejoinPersistedGroupsIfNeeded() async {
+        guard isRunning,
+              hasConnectedOnce,
+              let handle = toxHandle,
+              let selfName = currentSelfNameData() else {
+            return
+        }
+
+        let persisted = loadPersistedGroupChatIDs()
+        guard !persisted.isEmpty else { return }
+
+        let existing = Set(groupRooms.map { $0.chatID.uppercased() })
+        var joinedAny = false
+
+        for chatIDHex in persisted {
+            let normalized = chatIDHex.uppercased()
+            if existing.contains(normalized) { continue }
+
+            guard let chatID = Data(hexString: normalized),
+                  chatID.count == Int(toxw_group_chat_id_size()) else {
+                continue
+            }
+
+            var groupNumber: UInt32 = 0
+            var error: Int32 = 0
+            let joined = chatID.withUnsafeBytes { chatBuffer in
+                selfName.withUnsafeBytes { selfBuffer in
+                    guard let chatBase = chatBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let selfBase = selfBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                        return false
+                    }
+
+                    return toxw_group_join_by_chat_id(
+                        handle,
+                        chatBase,
+                        chatBuffer.count,
+                        selfBase,
+                        selfBuffer.count,
+                        &groupNumber,
+                        &error
+                    )
+                }
+            }
+
+            if joined, error == 0 {
+                joinedAny = true
+            }
+        }
+
+        if joinedAny {
+            refreshGroupRooms()
+            await refreshGroupRoomsWithRetry()
+        }
+    }
+
+    private func loadPersistedGroupChatIDs() -> [String] {
+        let raw = UserDefaults.standard.array(forKey: persistedGroupChatIDsKey) as? [String] ?? []
+        return raw
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+            .filter { !$0.isEmpty }
+    }
+
+    private func savePersistedGroupChatIDs(_ chatIDs: [String]) {
+        let normalized = Array(Set(chatIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }.filter { !$0.isEmpty }))
+            .sorted()
+        UserDefaults.standard.set(normalized, forKey: persistedGroupChatIDsKey)
     }
 
     private func avatarFileName(for url: URL) -> String {

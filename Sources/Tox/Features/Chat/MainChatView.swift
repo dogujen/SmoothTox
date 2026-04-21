@@ -113,6 +113,14 @@ struct MainChatView: View {
         .onDisappear {
             viewModel.shutdown()
         }
+        .overlay(alignment: .top) {
+            if viewModel.isIncomingCallPopupVisible {
+                incomingCallPopup
+                    .padding(.top, 14)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(5)
+            }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .automatic) {
                 Button {
@@ -203,6 +211,45 @@ struct MainChatView: View {
         } message: {
             Text(l10n.text("alert.reset.message"))
         }
+    }
+
+    private var incomingCallPopup: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "phone.bubble.left.fill")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.green)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(l10n.text("call.incoming.title"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(viewModel.incomingCallPeerName)
+                    .font(.headline)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 10)
+
+            Button(l10n.text("call.decline"), role: .destructive) {
+                viewModel.declineIncomingCallFromPopup()
+            }
+            .buttonStyle(.bordered)
+
+            Button(l10n.text("call.accept")) {
+                viewModel.acceptIncomingCallFromPopup()
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 560)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.green.opacity(0.28), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.15), radius: 10, y: 3)
+        .padding(.horizontal, 16)
     }
 
     private var callToolbarTitle: String {
