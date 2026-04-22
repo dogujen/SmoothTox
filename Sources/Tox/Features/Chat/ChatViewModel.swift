@@ -29,6 +29,7 @@ final class ChatViewModel {
     var peerSearchText = ""
     var pendingFriendRequests: [FriendRequest] = []
     var pendingGroupInvites: [GroupInviteRequest] = []
+    var pendingGroupHistorySyncRequests: [GroupHistorySyncRequest] = []
     var pendingFileRequests: [FileTransferRequest] = []
     var voiceCallStates: [UUID: VoiceCallState] = [:]
     var groupRooms: [GroupRoom] = []
@@ -313,6 +314,20 @@ final class ChatViewModel {
         }
     }
 
+    func acceptGroupHistorySyncRequest(_ request: GroupHistorySyncRequest) {
+        pendingGroupHistorySyncRequests.removeAll(where: { $0.id == request.id })
+        Task {
+            await toxClient.resolveGroupHistorySyncRequest(id: request.id, allow: true)
+        }
+    }
+
+    func rejectGroupHistorySyncRequest(_ request: GroupHistorySyncRequest) {
+        pendingGroupHistorySyncRequests.removeAll(where: { $0.id == request.id })
+        Task {
+            await toxClient.resolveGroupHistorySyncRequest(id: request.id, allow: false)
+        }
+    }
+
     func sendFile(url: URL) {
         guard let selectedPeerID else { return }
         isBusy = true
@@ -461,6 +476,13 @@ final class ChatViewModel {
 
         case .groupMembersUpdated(let groupID, let members):
             groupMembersByGroupID[groupID] = members
+
+        case .groupHistorySyncAuthorizationRequested(let request):
+            if !pendingGroupHistorySyncRequests.contains(where: { $0.id == request.id }) {
+                withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                    pendingGroupHistorySyncRequests.insert(request, at: 0)
+                }
+            }
 
         case .groupMessageReceived(let groupID, let senderName, let text):
             let incoming = ChatMessage(peerID: groupID, text: "\(senderName): \(text)", isOutgoing: false)

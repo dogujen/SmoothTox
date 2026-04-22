@@ -10,6 +10,7 @@ enum ToxEvent: Sendable {
     case groupRoomsUpdated([GroupRoom])
     case groupInvitesUpdated([GroupInviteRequest])
     case groupMembersUpdated(groupID: UUID, members: [GroupMember])
+    case groupHistorySyncAuthorizationRequested(GroupHistorySyncRequest)
     case groupMessageReceived(groupID: UUID, senderName: String, text: String)
     case friendRequestReceived(FriendRequest)
     case fileTransferRequestReceived(FileTransferRequest)
@@ -41,4 +42,5 @@ protocol ToxCoreClient: Sendable {
     func sendGroupMessage(_ text: String, to groupID: UUID) async -> Bool
     func acceptGroupInvite(id: UUID) async -> Bool
     func rejectGroupInvite(id: UUID) async
+    func resolveGroupHistorySyncRequest(id: UUID, allow: Bool) async
 }

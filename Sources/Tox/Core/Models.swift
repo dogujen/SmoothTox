@@ -121,3 +121,25 @@ struct GroupMember: Identifiable, Hashable, Sendable {
         self.displayName = displayName
     }
 }
+
+struct GroupHistorySyncRequest: Identifiable, Hashable, Sendable {
+    let id: UUID
+    let groupID: UUID
+    let groupName: String
+    let requesterName: String
+    let syncDeltaMinutes: UInt8
+
+    init(
+        id: UUID = UUID(),
+        groupID: UUID,
+        groupName: String,
+        requesterName: String,
+        syncDeltaMinutes: UInt8
+    ) {
+        self.id = id
+        self.groupID = groupID
+        self.groupName = groupName
+        self.requesterName = requesterName
+        self.syncDeltaMinutes = syncDeltaMinutes
+    }
+}

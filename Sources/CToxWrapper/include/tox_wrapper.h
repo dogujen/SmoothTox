@@ -21,6 +21,7 @@ typedef void (*toxw_group_invite_cb)(void *swift_user_data, uint32_t friend_numb
 typedef void (*toxw_group_peer_name_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id, const uint8_t *name, size_t name_length);
 typedef void (*toxw_group_peer_join_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id);
 typedef void (*toxw_group_peer_exit_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id);
+typedef void (*toxw_group_custom_private_packet_cb)(void *swift_user_data, uint32_t group_number, uint32_t peer_id, const uint8_t *data, size_t data_length);
 typedef void (*toxw_av_call_cb)(void *swift_user_data, uint32_t friend_number, bool audio_enabled, bool video_enabled);
 typedef void (*toxw_av_call_state_cb)(void *swift_user_data, uint32_t friend_number, uint32_t state);
 typedef void (*toxw_av_audio_frame_cb)(void *swift_user_data, uint32_t friend_number, const int16_t *pcm, size_t sample_count, uint8_t channels, uint32_t sampling_rate);
@@ -64,7 +65,8 @@ void toxw_set_group_callbacks(
     toxw_group_invite_cb group_invite_callback,
     toxw_group_peer_name_cb group_peer_name_callback,
     toxw_group_peer_join_cb group_peer_join_callback,
-    toxw_group_peer_exit_cb group_peer_exit_callback
+    toxw_group_peer_exit_cb group_peer_exit_callback,
+    toxw_group_custom_private_packet_cb group_custom_private_packet_callback
 );
 
 void toxw_iterate(ToxWrapper *wrapper);
@@ -222,12 +224,42 @@ bool toxw_group_send_message(
     int32_t *out_error_code
 );
 
+bool toxw_group_send_custom_private_packet(
+    ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint32_t peer_id,
+    bool lossless,
+    const uint8_t *data,
+    size_t data_length,
+    int32_t *out_error_code
+);
+
+bool toxw_group_is_public(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    bool *out_is_public,
+    int32_t *out_error_code
+);
+
 bool toxw_group_peer_get_name(
     const ToxWrapper *wrapper,
     uint32_t group_number,
     uint32_t peer_id,
     uint8_t *out_name,
     size_t *inout_length
+);
+
+bool toxw_group_peer_get_public_key(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint32_t peer_id,
+    uint8_t *out_public_key_32
+);
+
+bool toxw_group_self_get_public_key(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint8_t *out_public_key_32
 );
 
 bool toxw_group_invite_accept(

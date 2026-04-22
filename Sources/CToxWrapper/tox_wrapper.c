@@ -24,6 +24,7 @@ struct ToxWrapper {
     toxw_group_peer_name_cb group_peer_name_callback;
     toxw_group_peer_join_cb group_peer_join_callback;
     toxw_group_peer_exit_cb group_peer_exit_callback;
+    toxw_group_custom_private_packet_cb group_custom_private_packet_callback;
     toxw_av_call_cb av_call_callback;
     toxw_av_call_state_cb av_call_state_callback;
     toxw_av_audio_frame_cb av_audio_frame_callback;
@@ -176,6 +177,24 @@ static void toxw_on_group_peer_exit(
     }
 
     wrapper->group_peer_exit_callback(wrapper->swift_user_data, group_number, peer_id);
+}
+
+static void toxw_on_group_custom_private_packet(
+    Tox *tox,
+    uint32_t group_number,
+    uint32_t peer_id,
+    const uint8_t *data,
+    size_t data_length,
+    void *user_data
+) {
+    (void)tox;
+
+    ToxWrapper *wrapper = (ToxWrapper *)user_data;
+    if (wrapper == NULL || wrapper->group_custom_private_packet_callback == NULL || data == NULL || data_length == 0) {
+        return;
+    }
+
+    wrapper->group_custom_private_packet_callback(wrapper->swift_user_data, group_number, peer_id, data, data_length);
 }
 
 static void toxw_on_self_connection_status(Tox *tox, Tox_Connection connection_status, void *user_data) {
@@ -399,6 +418,7 @@ static ToxWrapper *toxw_create_internal(
     tox_callback_group_peer_name(tox, toxw_on_group_peer_name);
     tox_callback_group_peer_join(tox, toxw_on_group_peer_join);
     tox_callback_group_peer_exit(tox, toxw_on_group_peer_exit);
+    tox_callback_group_custom_private_packet(tox, toxw_on_group_custom_private_packet);
 
     if (out_error_code != NULL) {
         *out_error_code = 0;
@@ -497,7 +517,8 @@ void toxw_set_group_callbacks(
     toxw_group_invite_cb group_invite_callback,
     toxw_group_peer_name_cb group_peer_name_callback,
     toxw_group_peer_join_cb group_peer_join_callback,
-    toxw_group_peer_exit_cb group_peer_exit_callback
+    toxw_group_peer_exit_cb group_peer_exit_callback,
+    toxw_group_custom_private_packet_cb group_custom_private_packet_callback
 ) {
     if (wrapper == NULL) {
         return;
@@ -508,6 +529,7 @@ void toxw_set_group_callbacks(
     wrapper->group_peer_name_callback = group_peer_name_callback;
     wrapper->group_peer_join_callback = group_peer_join_callback;
     wrapper->group_peer_exit_callback = group_peer_exit_callback;
+    wrapper->group_custom_private_packet_callback = group_custom_private_packet_callback;
 }
 
 void toxw_iterate(ToxWrapper *wrapper) {
@@ -1162,12 +1184,17 @@ uint32_t toxw_group_chatlist(
         return 0;
     }
 
-    const uint32_t copy_count = full_size < capacity ? full_size : capacity;
-    for (uint32_t index = 0; index < copy_count; index++) {
-        out_group_numbers[index] = index;
+    uint32_t written = 0;
+    for (uint32_t index = 0; index < full_size && written < capacity; index++) {
+        uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE];
+        Tox_Err_Group_State_Query error = TOX_ERR_GROUP_STATE_QUERY_OK;
+        const bool ok = tox_group_get_chat_id(wrapper->tox, index, chat_id, &error);
+        if (ok && error == TOX_ERR_GROUP_STATE_QUERY_OK) {
+            out_group_numbers[written++] = index;
+        }
     }
 
-    return copy_count;
+    return written;
 }
 
 bool toxw_group_get_chat_id(
@@ -1224,6 +1251,68 @@ bool toxw_group_send_message(
     return ok && error == TOX_ERR_GROUP_SEND_MESSAGE_OK;
 }
 
+bool toxw_group_send_custom_private_packet(
+    ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint32_t peer_id,
+    bool lossless,
+    const uint8_t *data,
+    size_t data_length,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || data == NULL || data_length == 0) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_Send_Custom_Private_Packet error = TOX_ERR_GROUP_SEND_CUSTOM_PRIVATE_PACKET_OK;
+    const bool ok = tox_group_send_custom_private_packet(
+        wrapper->tox,
+        group_number,
+        peer_id,
+        lossless,
+        data,
+        data_length,
+        &error
+    );
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    return ok && error == TOX_ERR_GROUP_SEND_CUSTOM_PRIVATE_PACKET_OK;
+}
+
+bool toxw_group_is_public(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    bool *out_is_public,
+    int32_t *out_error_code
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || out_is_public == NULL) {
+        if (out_error_code != NULL) {
+            *out_error_code = -1;
+        }
+        return false;
+    }
+
+    Tox_Err_Group_State_Query error = TOX_ERR_GROUP_STATE_QUERY_OK;
+    const Tox_Group_Privacy_State state = tox_group_get_privacy_state(wrapper->tox, group_number, &error);
+
+    if (out_error_code != NULL) {
+        *out_error_code = (int32_t)error;
+    }
+
+    if (error != TOX_ERR_GROUP_STATE_QUERY_OK) {
+        return false;
+    }
+
+    *out_is_public = state == TOX_GROUP_PRIVACY_STATE_PUBLIC;
+    return true;
+}
+
 bool toxw_group_peer_get_name(
     const ToxWrapper *wrapper,
     uint32_t group_number,
@@ -1254,6 +1343,35 @@ bool toxw_group_peer_get_name(
 
     *inout_length = required;
     return true;
+}
+
+bool toxw_group_peer_get_public_key(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint32_t peer_id,
+    uint8_t *out_public_key_32
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || out_public_key_32 == NULL) {
+        return false;
+    }
+
+    Tox_Err_Group_Peer_Query error = TOX_ERR_GROUP_PEER_QUERY_OK;
+    const bool ok = tox_group_peer_get_public_key(wrapper->tox, group_number, peer_id, out_public_key_32, &error);
+    return ok && error == TOX_ERR_GROUP_PEER_QUERY_OK;
+}
+
+bool toxw_group_self_get_public_key(
+    const ToxWrapper *wrapper,
+    uint32_t group_number,
+    uint8_t *out_public_key_32
+) {
+    if (wrapper == NULL || wrapper->tox == NULL || out_public_key_32 == NULL) {
+        return false;
+    }
+
+    Tox_Err_Group_Self_Query error = TOX_ERR_GROUP_SELF_QUERY_OK;
+    const bool ok = tox_group_self_get_public_key(wrapper->tox, group_number, out_public_key_32, &error);
+    return ok && error == TOX_ERR_GROUP_SELF_QUERY_OK;
 }
 
 bool toxw_group_invite_accept(

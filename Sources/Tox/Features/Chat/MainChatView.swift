@@ -122,17 +122,27 @@ struct MainChatView: View {
             }
         }
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    viewModel.copySelfToxID()
+                } label: {
+                    Label(l10n.text("toolbar.copyID"), systemImage: viewModel.didCopyToxID ? "checkmark" : "doc.on.doc")
+                }
+            }
+
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    viewModel.openHostGroupDialog()
+                } label: {
+                    Label(l10n.text("toolbar.hostGroup"), systemImage: "person.3.sequence")
+                }
+            }
+
             ToolbarItemGroup(placement: .automatic) {
                 Button {
                     openAttachmentPicker()
                 } label: {
                     Label(l10n.text("toolbar.attach"), systemImage: "paperclip")
-                }
-
-                Button {
-                    viewModel.copySelfToxID()
-                } label: {
-                    Label(l10n.text("toolbar.copyID"), systemImage: viewModel.didCopyToxID ? "checkmark" : "doc.on.doc")
                 }
 
                 Button {
@@ -158,12 +168,6 @@ struct MainChatView: View {
                     }
                 } label: {
                     Label(callToolbarTitle, systemImage: callToolbarIcon)
-                }
-
-                Button {
-                    viewModel.openHostGroupDialog()
-                } label: {
-                    Label(l10n.text("toolbar.hostGroup"), systemImage: "person.3.sequence")
                 }
 
                 Button {
@@ -462,6 +466,46 @@ struct MainChatView: View {
 
     private var pendingRequestsSection: some View {
         VStack(spacing: 10) {
+            if !viewModel.pendingGroupHistorySyncRequests.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("History Sync")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    ForEach(viewModel.pendingGroupHistorySyncRequests.prefix(3)) { request in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(request.groupName)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+
+                            Text("\(request.requesterName) wants last \(request.syncDeltaMinutes)m")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+
+                            HStack {
+                                Button(l10n.text("pending.reject"), role: .destructive) {
+                                    viewModel.rejectGroupHistorySyncRequest(request)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                                Button(l10n.text("pending.accept")) {
+                                    viewModel.acceptGroupHistorySyncRequest(request)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                }
+                .padding(.horizontal, 6)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
             if !viewModel.pendingGroupInvites.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(l10n.text("pending.groupInvites"))
@@ -570,6 +614,7 @@ struct MainChatView: View {
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+        .animation(.spring(response: 0.30, dampingFraction: 0.86), value: viewModel.pendingGroupHistorySyncRequests)
         .animation(.spring(response: 0.30, dampingFraction: 0.86), value: viewModel.pendingGroupInvites)
         .animation(.spring(response: 0.30, dampingFraction: 0.86), value: viewModel.pendingFriendRequests)
         .animation(.spring(response: 0.30, dampingFraction: 0.86), value: viewModel.pendingFileRequests)

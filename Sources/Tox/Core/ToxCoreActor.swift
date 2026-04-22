@@ -23,6 +23,19 @@ private struct PendingGroupInviteContext {
     let inviteData: Data
 }
 
+private struct GroupSyncAuthorizationContext {
+    let id: UUID
+    let groupNumber: UInt32
+    let requesterPeerID: UInt32
+    let deltaMinutes: UInt8
+}
+
+private struct GroupHistoryEntry {
+    let timestamp: Date
+    let senderName: String
+    let text: String
+}
+
 private let toxSelfConnectionCallback: toxw_self_connection_status_cb = { swiftUserData, connectionStatus in
     guard let swiftUserData else { return }
     let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
@@ -200,6 +213,19 @@ private let toxGroupPeerExitCallback: toxw_group_peer_exit_cb = { swiftUserData,
     }
 }
 
+private let toxGroupCustomPrivatePacketCallback: toxw_group_custom_private_packet_cb = { swiftUserData, groupNumber, peerID, data, dataLength in
+    guard let swiftUserData,
+          let data,
+          dataLength > 0 else { return }
+
+    let actor = Unmanaged<ToxCoreActor>.fromOpaque(swiftUserData).takeUnretainedValue()
+    let packetData = Data(bytes: data, count: Int(dataLength))
+
+    Task {
+        await actor.onGroupCustomPrivatePacket(groupNumber: groupNumber, peerID: peerID, packetData: packetData)
+    }
+}
+
 actor ToxCoreActor: ToxCoreClient {
     let events: AsyncStream<ToxEvent>
 
@@ -219,6 +245,9 @@ actor ToxCoreActor: ToxCoreClient {
     private var groupNumberToRoomID: [UInt32: UUID] = [:]
     private var pendingGroupInvites: [UUID: PendingGroupInviteContext] = [:]
     private var groupPeerNames: [UInt32: [UInt32: String]] = [:]
+    private var pendingGroupSyncAuthorizations: [UUID: GroupSyncAuthorizationContext] = [:]
+    private var groupHistoryByRoomID: [UUID: [GroupHistoryEntry]] = [:]
+    private var seenGroupMessageKeys: [UUID: [String: Date]] = [:]
     private var hasConnectedOnce = false
     private var activeCallFriendNumber: UInt32?
     private let appConfig = BootstrapConfigLoader.loadFromBundle()
@@ -235,6 +264,11 @@ actor ToxCoreActor: ToxCoreClient {
     private let toxavCallStateError: UInt32 = 1
     private let toxavCallStateFinished: UInt32 = 2
     private let persistedGroupChatIDsKey = "persisted_group_chat_ids_v1"
+    private let groupLogsEnabled = true
+    private let groupSyncMaxHistoryWindow: TimeInterval = 60 * 60 * 24 * 300
+    private let groupSyncRequestPrefix = "ngch_request|v1|"
+    private let groupSyncMessagePrefix = "ngch_syncmsg|v1|"
+    private let groupSyncDefaultDeltaMinutes: UInt8 = 120
 
     init() {
         var continuation: AsyncStream<ToxEvent>.Continuation?
@@ -318,7 +352,8 @@ actor ToxCoreActor: ToxCoreClient {
             toxGroupInviteCallback,
             toxGroupPeerNameCallback,
             toxGroupPeerJoinCallback,
-            toxGroupPeerExitCallback
+            toxGroupPeerExitCallback,
+            toxGroupCustomPrivatePacketCallback
         )
 
         bootstrapFromConfig()
@@ -362,6 +397,9 @@ actor ToxCoreActor: ToxCoreClient {
         groupNumberToRoomID.removeAll()
         pendingGroupInvites.removeAll()
         groupPeerNames.removeAll()
+        pendingGroupSyncAuthorizations.removeAll()
+        groupHistoryByRoomID.removeAll()
+        seenGroupMessageKeys.removeAll()
         hasConnectedOnce = false
         activeCallFriendNumber = nil
         callAudioEngine.stopCapture()
@@ -644,6 +682,9 @@ actor ToxCoreActor: ToxCoreClient {
               let chatID = Data(hexString: trimmed),
               chatID.count == Int(toxw_group_chat_id_size()) else { return false }
 
+        let normalizedChatID = trimmed.uppercased()
+        logGroup("join requested chatID=\(normalizedChatID.prefix(16))…")
+
         var groupNumber: UInt32 = 0
         var error: Int32 = 0
 
@@ -666,13 +707,51 @@ actor ToxCoreActor: ToxCoreClient {
             }
         }
 
-        guard joined, error == 0 else { return false }
+        if !(joined && error == 0) {
+            logGroup("join call returned failure error=\(error), checking existing rooms")
+            refreshGroupRooms()
+            if groupRooms.contains(where: { $0.chatID.uppercased() == normalizedChatID }) {
+                logGroup("join treated as success because group already exists in local list")
+                return true
+            }
+            logGroup("join failed chatID=\(normalizedChatID.prefix(16))…")
+            return false
+        }
 
         refreshGroupRooms()
+        if let roomID = groupNumberToRoomID[groupNumber],
+           let index = groupRooms.firstIndex(where: { $0.id == roomID }) {
+            let room = groupRooms[index]
+            if room.chatID.isEmpty {
+                groupRooms[index] = GroupRoom(id: room.id, name: room.name, chatID: normalizedChatID, isHost: room.isHost)
+                emit(.groupRoomsUpdated(groupRooms))
+            }
+        } else {
+            let provisionalID = UUID()
+            groupNumberToRoomID[groupNumber] = provisionalID
+            let provisional = GroupRoom(
+                id: provisionalID,
+                name: "Group \(normalizedChatID.prefix(10))",
+                chatID: normalizedChatID,
+                isHost: false
+            )
+            groupRooms.append(provisional)
+            emit(.groupRoomsUpdated(groupRooms))
+            logGroup("join provisional room inserted groupNumber=\(groupNumber)")
+        }
+
+        appendPersistedGroupChatID(normalizedChatID)
+        logGroup("join succeeded groupNumber=\(groupNumber) chatID=\(normalizedChatID.prefix(16))…")
+        Task {
+            await hydrateGroupPeers(groupNumber: groupNumber)
+        }
+        await refreshGroupRoomsWithRetry()
         return true
     }
 
     func leaveGroup(id: UUID) async {
+        let removedChatID = groupRooms.first(where: { $0.id == id })?.chatID
+
         guard let groupNumber = groupNumberToRoomID.first(where: { $0.value == id })?.key,
               let handle = toxHandle else {
             return
@@ -680,7 +759,23 @@ actor ToxCoreActor: ToxCoreClient {
 
         var error: Int32 = 0
         _ = toxw_group_leave(handle, groupNumber, &error)
+
+        if let removedChatID, !removedChatID.isEmpty {
+            removePersistedGroupChatID(removedChatID)
+        }
+
+        groupRooms.removeAll(where: { $0.id == id })
+        groupNumberToRoomID.removeValue(forKey: groupNumber)
+        groupPeerNames.removeValue(forKey: groupNumber)
+        emit(.groupRoomsUpdated(groupRooms))
+
         refreshGroupRooms()
+
+        if let removedChatID, !removedChatID.isEmpty {
+            logGroup("leave requested groupNumber=\(groupNumber) chatID=\(removedChatID.prefix(16))… error=\(error)")
+        } else {
+            logGroup("leave requested groupNumber=\(groupNumber) error=\(error)")
+        }
     }
 
     func sendGroupMessage(_ text: String, to groupID: UUID) async -> Bool {
@@ -698,6 +793,11 @@ actor ToxCoreActor: ToxCoreClient {
                 return false
             }
             return toxw_group_send_message(handle, groupNumber, base, buffer.count, &error)
+        }
+
+        if ok && error == 0 {
+            _ = registerSeenGroupMessage(groupID: groupID, senderName: selfDisplayNameCache, text: text, timestamp: .now)
+            appendGroupHistoryEntry(groupID: groupID, timestamp: .now, senderName: selfDisplayNameCache, text: text)
         }
 
         return ok && error == 0
@@ -733,7 +833,12 @@ actor ToxCoreActor: ToxCoreClient {
             }
         }
 
-        guard accepted, error == 0 else { return false }
+        guard accepted, error == 0 else {
+            logGroup("invite accept failed inviterFriend=\(pending.friendNumber) error=\(error)")
+            return false
+        }
+
+        logGroup("invite accepted inviterFriend=\(pending.friendNumber) groupNumber=\(groupNumber) name=\(pending.request.groupName)")
 
         pendingGroupInvites.removeValue(forKey: id)
         emitPendingGroupInvites()
@@ -758,6 +863,9 @@ actor ToxCoreActor: ToxCoreClient {
         }
 
         await refreshGroupRoomsWithRetry()
+        Task {
+            await hydrateGroupPeers(groupNumber: groupNumber)
+        }
 
         return true
     }
@@ -765,6 +873,16 @@ actor ToxCoreActor: ToxCoreClient {
     func rejectGroupInvite(id: UUID) async {
         pendingGroupInvites.removeValue(forKey: id)
         emitPendingGroupInvites()
+    }
+
+    func resolveGroupHistorySyncRequest(id: UUID, allow: Bool) async {
+        guard let pending = pendingGroupSyncAuthorizations.removeValue(forKey: id) else { return }
+        guard allow else {
+            logGroup("sync auth rejected groupNumber=\(pending.groupNumber) peerID=\(pending.requesterPeerID)")
+            return
+        }
+
+        await sendGroupHistorySync(to: pending.requesterPeerID, groupNumber: pending.groupNumber, deltaMinutes: pending.deltaMinutes)
     }
 
     private func sendFile(handle: OpaquePointer, friendNumber: UInt32, url: URL, fileNameOverride: String?, fileKind: UInt32) -> Bool {
@@ -880,6 +998,7 @@ actor ToxCoreActor: ToxCoreClient {
         callAudioEngine.stopCapture()
 
         profileStore.resetAll()
+        UserDefaults.standard.removeObject(forKey: persistedGroupChatIDsKey)
         eventContinuation.yield(.peerListUpdated([]))
         eventContinuation.yield(.groupRoomsUpdated([]))
         eventContinuation.yield(.groupInvitesUpdated([]))
@@ -1103,10 +1222,12 @@ actor ToxCoreActor: ToxCoreClient {
         hasConnectedOnce = connectionStatus > 0
         emit(.connectionStateChanged(state))
         emitSelfAddressIfAvailable()
+        logGroup("self connection changed status=\(connectionStatus)")
 
         if connectionStatus > 0 {
             Task {
                 await autoRejoinPersistedGroupsIfNeeded()
+                await hydrateAllVisibleGroupPeers()
             }
         }
     }
@@ -1165,6 +1286,10 @@ actor ToxCoreActor: ToxCoreClient {
         guard let groupID = groupNumberToRoomID[groupNumber], !text.isEmpty else { return }
         let senderName = resolveGroupPeerName(groupNumber: groupNumber, peerID: peerID)
         setGroupPeerName(groupNumber: groupNumber, peerID: peerID, name: senderName)
+        guard registerSeenGroupMessage(groupID: groupID, senderName: senderName, text: text, timestamp: .now) else {
+            return
+        }
+        appendGroupHistoryEntry(groupID: groupID, timestamp: .now, senderName: senderName, text: text)
         emitGroupMembers(for: groupNumber)
         emit(.groupMessageReceived(groupID: groupID, senderName: senderName, text: text))
     }
@@ -1182,6 +1307,7 @@ actor ToxCoreActor: ToxCoreClient {
             friendNumber: friendNumber,
             inviteData: inviteData
         )
+        logGroup("invite received from friend=\(friendNumber) groupName=\(finalGroupName) inviteBytes=\(inviteData.count)")
         emitPendingGroupInvites()
     }
 
@@ -1198,6 +1324,12 @@ actor ToxCoreActor: ToxCoreClient {
             setGroupPeerName(groupNumber: groupNumber, peerID: peerID, name: "Peer #\(peerID)")
             emitGroupMembers(for: groupNumber)
         }
+
+        Task {
+            let jitterSeconds = UInt64(Int.random(in: 2...8))
+            try? await Task.sleep(for: .seconds(Int(jitterSeconds)))
+            await sendHistorySyncRequestIfNeeded(groupNumber: groupNumber, peerID: peerID)
+        }
     }
 
     fileprivate func onGroupPeerExited(groupNumber: UInt32, peerID: UInt32) {
@@ -1209,6 +1341,22 @@ actor ToxCoreActor: ToxCoreClient {
             groupPeerNames[groupNumber] = members
         }
         emitGroupMembers(for: groupNumber)
+    }
+
+    fileprivate func onGroupCustomPrivatePacket(groupNumber: UInt32, peerID: UInt32, packetData: Data) {
+        guard !packetData.isEmpty,
+              let payload = String(data: packetData, encoding: .utf8) else {
+            return
+        }
+
+        if payload.hasPrefix(groupSyncRequestPrefix) {
+            onGroupSyncRequestPacket(groupNumber: groupNumber, peerID: peerID, payload: payload)
+            return
+        }
+
+        if payload.hasPrefix(groupSyncMessagePrefix) {
+            onGroupSyncMessagePacket(groupNumber: groupNumber, peerID: peerID, payload: payload)
+        }
     }
 
     fileprivate func onIncomingCall(friendNumber: UInt32) {
@@ -1449,21 +1597,35 @@ actor ToxCoreActor: ToxCoreClient {
             groupRooms = []
             groupNumberToRoomID = [:]
             groupPeerNames = [:]
-            if hasConnectedOnce {
-                savePersistedGroupChatIDs([])
-            }
+            logGroup("rooms refresh skipped: no tox handle")
             emit(.groupRoomsUpdated([]))
             return
         }
 
         let count = Int(toxw_group_chatlist_size(handle))
         guard count > 0 else {
+            if !groupRooms.isEmpty {
+                let persisted = Set(loadPersistedGroupChatIDs())
+                let filtered = groupRooms.filter { room in
+                    guard !room.chatID.isEmpty else { return false }
+                    return persisted.contains(room.chatID.uppercased())
+                }
+
+                if !filtered.isEmpty {
+                    groupRooms = filtered
+                    let keptIDs = Set(filtered.map(\.id))
+                    groupNumberToRoomID = groupNumberToRoomID.filter { keptIDs.contains($0.value) }
+                    groupPeerNames = groupPeerNames.filter { groupNumberToRoomID[$0.key] != nil }
+                    logGroup("rooms refresh empty: chatlist_size=0 (keeping \(groupRooms.count) provisional room(s))")
+                    emit(.groupRoomsUpdated(groupRooms))
+                    return
+                }
+            }
+
             groupRooms = []
             groupNumberToRoomID = [:]
             groupPeerNames = [:]
-            if hasConnectedOnce {
-                savePersistedGroupChatIDs([])
-            }
+            logGroup("rooms refresh empty: chatlist_size=0")
             emit(.groupRoomsUpdated([]))
             return
         }
@@ -1478,9 +1640,7 @@ actor ToxCoreActor: ToxCoreClient {
             groupRooms = []
             groupNumberToRoomID = [:]
             groupPeerNames = [:]
-            if hasConnectedOnce {
-                savePersistedGroupChatIDs([])
-            }
+            logGroup("rooms refresh failed: invalid chatID size")
             emit(.groupRoomsUpdated([]))
             return
         }
@@ -1518,12 +1678,137 @@ actor ToxCoreActor: ToxCoreClient {
         let activeNumbers = Set(nextMap.keys)
         groupPeerNames = groupPeerNames.filter { activeNumbers.contains($0.key) }
         emit(.groupRoomsUpdated(nextRooms))
-        if hasConnectedOnce {
+        logGroup("rooms refreshed count=\(nextRooms.count)")
+        if hasConnectedOnce, !nextRooms.isEmpty {
             savePersistedGroupChatIDs(nextRooms.map(\ .chatID).filter { !$0.isEmpty })
         }
         for groupNumber in nextMap.keys {
             emitGroupMembers(for: groupNumber)
         }
+    }
+
+    private func sendHistorySyncRequestIfNeeded(groupNumber: UInt32, peerID: UInt32) async {
+        guard isRunning,
+              let handle = toxHandle,
+              groupNumberToRoomID[groupNumber] != nil,
+              isPublicGroup(groupNumber: groupNumber) else {
+            return
+        }
+
+        if isSelfPeer(groupNumber: groupNumber, peerID: peerID) {
+            return
+        }
+
+        let payload = "\(groupSyncRequestPrefix)\(groupSyncDefaultDeltaMinutes)"
+        guard let data = payload.data(using: .utf8) else { return }
+
+        var error: Int32 = 0
+        let ok = data.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+            return toxw_group_send_custom_private_packet(handle, groupNumber, peerID, true, base, buffer.count, &error)
+        }
+
+        logGroup("sync request send groupNumber=\(groupNumber) peerID=\(peerID) ok=\(ok) error=\(error)")
+    }
+
+    private func onGroupSyncRequestPacket(groupNumber: UInt32, peerID: UInt32, payload: String) {
+        guard isPublicGroup(groupNumber: groupNumber),
+              let groupID = groupNumberToRoomID[groupNumber],
+              let group = groupRooms.first(where: { $0.id == groupID }) else {
+            return
+        }
+
+        let suffix = String(payload.dropFirst(groupSyncRequestPrefix.count))
+        let requestedDelta = UInt8(suffix) ?? groupSyncDefaultDeltaMinutes
+        let requesterName = resolveGroupPeerName(groupNumber: groupNumber, peerID: peerID)
+        let request = GroupHistorySyncRequest(
+            groupID: groupID,
+            groupName: group.name,
+            requesterName: requesterName,
+            syncDeltaMinutes: requestedDelta
+        )
+
+        pendingGroupSyncAuthorizations[request.id] = GroupSyncAuthorizationContext(
+            id: request.id,
+            groupNumber: groupNumber,
+            requesterPeerID: peerID,
+            deltaMinutes: requestedDelta
+        )
+
+        logGroup("sync auth request queued groupNumber=\(groupNumber) peerID=\(peerID) delta=\(requestedDelta)")
+        emit(.groupHistorySyncAuthorizationRequested(request))
+    }
+
+    private func onGroupSyncMessagePacket(groupNumber: UInt32, peerID: UInt32, payload: String) {
+        guard let groupID = groupNumberToRoomID[groupNumber],
+              isPublicGroup(groupNumber: groupNumber) else {
+            return
+        }
+
+        let body = String(payload.dropFirst(groupSyncMessagePrefix.count))
+        let parts = body.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count >= 3,
+              let timestampSec = TimeInterval(parts[0]),
+              let senderData = Data(base64Encoded: String(parts[1])),
+              let textData = Data(base64Encoded: String(parts[2])),
+              let senderName = String(data: senderData, encoding: .utf8),
+              let text = String(data: textData, encoding: .utf8),
+              !text.isEmpty else {
+            return
+        }
+
+        let timestamp = Date(timeIntervalSince1970: timestampSec)
+        guard abs(Date.now.timeIntervalSince(timestamp)) <= groupSyncMaxHistoryWindow else {
+            return
+        }
+
+        guard registerSeenGroupMessage(groupID: groupID, senderName: senderName, text: text, timestamp: timestamp) else {
+            return
+        }
+
+        setGroupPeerName(groupNumber: groupNumber, peerID: peerID, name: senderName)
+        appendGroupHistoryEntry(groupID: groupID, timestamp: timestamp, senderName: senderName, text: text)
+        emitGroupMembers(for: groupNumber)
+        emit(.groupMessageReceived(groupID: groupID, senderName: senderName, text: text))
+    }
+
+    private func sendGroupHistorySync(to peerID: UInt32, groupNumber: UInt32, deltaMinutes: UInt8) async {
+        guard let handle = toxHandle,
+              let groupID = groupNumberToRoomID[groupNumber],
+              isPublicGroup(groupNumber: groupNumber) else {
+            return
+        }
+
+        let deltaSeconds = max(60.0, TimeInterval(deltaMinutes) * 60.0)
+        let cutoff = Date.now.addingTimeInterval(-deltaSeconds)
+        let entries = groupHistoryByRoomID[groupID, default: []]
+            .filter { $0.timestamp >= cutoff }
+            .sorted { $0.timestamp < $1.timestamp }
+
+        if entries.isEmpty {
+            logGroup("sync send skipped groupNumber=\(groupNumber) peerID=\(peerID) reason=no_entries")
+            return
+        }
+
+        for entry in entries {
+            let senderB64 = Data(entry.senderName.utf8).base64EncodedString()
+            let textB64 = Data(entry.text.utf8).base64EncodedString()
+            let payload = "\(groupSyncMessagePrefix)\(entry.timestamp.timeIntervalSince1970)|\(senderB64)|\(textB64)"
+            guard let data = payload.data(using: .utf8) else { continue }
+
+            var error: Int32 = 0
+            let sent = data.withUnsafeBytes { buffer in
+                guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                return toxw_group_send_custom_private_packet(handle, groupNumber, peerID, true, base, buffer.count, &error)
+            }
+
+            if !sent || error != 0 {
+                logGroup("sync send failed groupNumber=\(groupNumber) peerID=\(peerID) error=\(error)")
+                return
+            }
+        }
+
+        logGroup("sync send completed groupNumber=\(groupNumber) peerID=\(peerID) count=\(entries.count)")
     }
 
     private func emitPendingGroupInvites() {
@@ -1539,7 +1824,11 @@ actor ToxCoreActor: ToxCoreClient {
     }
 
     private func resolveGroupPeerName(groupNumber: UInt32, peerID: UInt32) -> String {
-        guard let handle = toxHandle else { return "Peer #\(peerID)" }
+        tryResolveGroupPeerName(groupNumber: groupNumber, peerID: peerID) ?? "Peer #\(peerID)"
+    }
+
+    private func tryResolveGroupPeerName(groupNumber: UInt32, peerID: UInt32) -> String? {
+        guard let handle = toxHandle else { return nil }
 
         var size: Int = 128
         var bytes = [UInt8](repeating: 0, count: size)
@@ -1552,16 +1841,16 @@ actor ToxCoreActor: ToxCoreClient {
             let retried = bytes.withUnsafeMutableBufferPointer { buffer in
                 toxw_group_peer_get_name(handle, groupNumber, peerID, buffer.baseAddress, &size)
             }
-            guard retried else { return "Peer #\(peerID)" }
+            guard retried else { return nil }
         } else if !success {
-            return "Peer #\(peerID)"
+            return nil
         }
 
         guard size > 0,
               size <= bytes.count,
               let name = String(data: Data(bytes[0..<size]), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !name.isEmpty else {
-            return "Peer #\(peerID)"
+            return nil
         }
 
         return name
@@ -1571,6 +1860,56 @@ actor ToxCoreActor: ToxCoreClient {
         var members = groupPeerNames[groupNumber, default: [:]]
         members[peerID] = name
         groupPeerNames[groupNumber] = members
+    }
+
+    private func appendGroupHistoryEntry(groupID: UUID, timestamp: Date, senderName: String, text: String) {
+        var entries = groupHistoryByRoomID[groupID, default: []]
+        entries.append(GroupHistoryEntry(timestamp: timestamp, senderName: senderName, text: text))
+        if entries.count > 5000 {
+            entries.removeFirst(entries.count - 5000)
+        }
+        groupHistoryByRoomID[groupID] = entries
+    }
+
+    private func registerSeenGroupMessage(groupID: UUID, senderName: String, text: String, timestamp: Date) -> Bool {
+        let rounded = Int(timestamp.timeIntervalSince1970)
+        let key = "\(rounded)|\(senderName)|\(text)"
+        var map = seenGroupMessageKeys[groupID, default: [:]]
+
+        let now = Date.now
+        map = map.filter { now.timeIntervalSince($0.value) <= groupSyncMaxHistoryWindow }
+        if map[key] != nil {
+            seenGroupMessageKeys[groupID] = map
+            return false
+        }
+
+        map[key] = now
+        seenGroupMessageKeys[groupID] = map
+        return true
+    }
+
+    private func isPublicGroup(groupNumber: UInt32) -> Bool {
+        guard let handle = toxHandle else { return false }
+        var isPublic = false
+        var error: Int32 = 0
+        let ok = toxw_group_is_public(handle, groupNumber, &isPublic, &error)
+        return ok && error == 0 && isPublic
+    }
+
+    private func isSelfPeer(groupNumber: UInt32, peerID: UInt32) -> Bool {
+        guard let handle = toxHandle else { return false }
+
+        var selfKey = [UInt8](repeating: 0, count: 32)
+        var peerKey = [UInt8](repeating: 0, count: 32)
+
+        let gotSelf = selfKey.withUnsafeMutableBufferPointer { ptr in
+            toxw_group_self_get_public_key(handle, groupNumber, ptr.baseAddress)
+        }
+        let gotPeer = peerKey.withUnsafeMutableBufferPointer { ptr in
+            toxw_group_peer_get_public_key(handle, groupNumber, peerID, ptr.baseAddress)
+        }
+
+        return gotSelf && gotPeer && selfKey == peerKey
     }
 
     private func emitGroupMembers(for groupNumber: UInt32) {
@@ -1595,6 +1934,58 @@ actor ToxCoreActor: ToxCoreClient {
         }
     }
 
+    private func hydrateAllVisibleGroupPeers() async {
+        let groupNumbers = Array(groupNumberToRoomID.keys)
+        guard !groupNumbers.isEmpty else { return }
+
+        for groupNumber in groupNumbers {
+            await hydrateGroupPeers(groupNumber: groupNumber)
+        }
+    }
+
+    private func hydrateGroupPeers(groupNumber: UInt32) async {
+        let delays: [UInt64] = [250, 900, 1800]
+        for delay in delays {
+            try? await Task.sleep(for: .milliseconds(Int(delay)))
+            if !isRunning { return }
+            guard groupNumberToRoomID[groupNumber] != nil else { return }
+
+            let discovered = discoverGroupPeerNames(groupNumber: groupNumber)
+            if discovered.isEmpty { continue }
+
+            var members = groupPeerNames[groupNumber, default: [:]]
+            for (peerID, name) in discovered {
+                members[peerID] = name
+            }
+            groupPeerNames[groupNumber] = members
+            emitGroupMembers(for: groupNumber)
+            logGroup("peer hydration groupNumber=\(groupNumber) found=\(discovered.count)")
+        }
+    }
+
+    private func discoverGroupPeerNames(groupNumber: UInt32) -> [UInt32: String] {
+        let maxProbe: UInt32 = 512
+        var found: [UInt32: String] = [:]
+        var missesInARow = 0
+
+        for peerID in 0..<maxProbe {
+            if let name = tryResolveGroupPeerName(groupNumber: groupNumber, peerID: peerID) {
+                found[peerID] = name
+                missesInARow = 0
+            } else {
+                missesInARow += 1
+                if !found.isEmpty && missesInARow >= 32 {
+                    break
+                }
+                if found.isEmpty && peerID >= 96 {
+                    break
+                }
+            }
+        }
+
+        return found
+    }
+
     private func autoRejoinPersistedGroupsIfNeeded() async {
         guard isRunning,
               hasConnectedOnce,
@@ -1605,6 +1996,7 @@ actor ToxCoreActor: ToxCoreClient {
 
         let persisted = loadPersistedGroupChatIDs()
         guard !persisted.isEmpty else { return }
+        logGroup("auto-rejoin start persistedCount=\(persisted.count)")
 
         let existing = Set(groupRooms.map { $0.chatID.uppercased() })
         var joinedAny = false
@@ -1641,13 +2033,44 @@ actor ToxCoreActor: ToxCoreClient {
 
             if joined, error == 0 {
                 joinedAny = true
+                let provisionalID = groupNumberToRoomID[groupNumber] ?? UUID()
+                groupNumberToRoomID[groupNumber] = provisionalID
+
+                if let index = groupRooms.firstIndex(where: { $0.id == provisionalID }) {
+                    let current = groupRooms[index]
+                    groupRooms[index] = GroupRoom(
+                        id: current.id,
+                        name: current.name,
+                        chatID: current.chatID.isEmpty ? normalized : current.chatID,
+                        isHost: current.isHost
+                    )
+                } else {
+                    groupRooms.append(
+                        GroupRoom(
+                            id: provisionalID,
+                            name: "Group \(normalized.prefix(10))",
+                            chatID: normalized,
+                            isHost: false
+                        )
+                    )
+                }
+                emit(.groupRoomsUpdated(groupRooms))
+                logGroup("auto-rejoin success groupNumber=\(groupNumber) chatID=\(normalized.prefix(16))…")
+            } else {
+                logGroup("auto-rejoin failed error=\(error) chatID=\(normalized.prefix(16))…")
             }
         }
 
         if joinedAny {
             refreshGroupRooms()
             await refreshGroupRoomsWithRetry()
+            logGroup("auto-rejoin completed with updates")
         }
+    }
+
+    private func logGroup(_ message: String) {
+        guard groupLogsEnabled else { return }
+        print("[GroupFlow] \(message)")
     }
 
     private func loadPersistedGroupChatIDs() -> [String] {
@@ -1661,6 +2084,23 @@ actor ToxCoreActor: ToxCoreClient {
         let normalized = Array(Set(chatIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }.filter { !$0.isEmpty }))
             .sorted()
         UserDefaults.standard.set(normalized, forKey: persistedGroupChatIDsKey)
+    }
+
+    private func appendPersistedGroupChatID(_ chatID: String) {
+        let normalized = chatID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !normalized.isEmpty else { return }
+        var existing = loadPersistedGroupChatIDs()
+        if !existing.contains(normalized) {
+            existing.append(normalized)
+            savePersistedGroupChatIDs(existing)
+        }
+    }
+
+    private func removePersistedGroupChatID(_ chatID: String) {
+        let normalized = chatID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !normalized.isEmpty else { return }
+        let filtered = loadPersistedGroupChatIDs().filter { $0 != normalized }
+        savePersistedGroupChatIDs(filtered)
     }
 
     private func avatarFileName(for url: URL) -> String {
